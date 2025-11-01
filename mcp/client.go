@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"nofx/utils"
 )
 
 // Provider AI提供商类型
@@ -188,7 +190,7 @@ func (cfg *Client) callOnce(systemPrompt, userPrompt string) (string, error) {
 	}
 
 	// 发送请求
-	client := &http.Client{Timeout: cfg.Timeout}
+	client := utils.CreateHTTPClient(int(cfg.Timeout.Seconds()))
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("发送请求失败: %w", err)

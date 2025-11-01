@@ -22,6 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"nofx/utils"
 )
 
 // AsterTrader Aster交易平台实现
@@ -63,14 +64,11 @@ func NewAsterTrader(user, signer, privateKeyHex string) (*AsterTrader, error) {
 		signer:          signer,
 		privateKey:      privKey,
 		symbolPrecision: make(map[string]SymbolPrecision),
-		client: &http.Client{
-			Timeout: 30 * time.Second, // 增加到30秒
-			Transport: &http.Transport{
+		client: utils.CreateHTTPClientWithTransport(30, &http.Transport{
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 10 * time.Second,
 				IdleConnTimeout:       90 * time.Second,
-			},
-		},
+			}),
 		baseURL: "https://fapi.asterdex.com",
 	}, nil
 }

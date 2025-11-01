@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"nofx/utils"
 )
 
 // defaultMainstreamCoins 默认主流币种池（从配置文件读取）
@@ -148,9 +150,7 @@ func GetCoinPool() ([]CoinInfo, error) {
 func fetchCoinPool() ([]CoinInfo, error) {
 	log.Printf("🔄 正在请求AI500币种池...")
 
-	client := &http.Client{
-		Timeout: coinPoolConfig.Timeout,
-	}
+	client := utils.CreateHTTPClient(int(coinPoolConfig.Timeout.Seconds()))
 
 	resp, err := client.Get(coinPoolConfig.APIURL)
 	if err != nil {
@@ -469,9 +469,7 @@ func GetOITopPositions() ([]OIPosition, error) {
 func fetchOITop() ([]OIPosition, error) {
 	log.Printf("🔄 正在请求OI Top数据...")
 
-	client := &http.Client{
-		Timeout: oiTopConfig.Timeout,
-	}
+	client := utils.CreateHTTPClient(int(oiTopConfig.Timeout.Seconds()))
 
 	resp, err := client.Get(oiTopConfig.APIURL)
 	if err != nil {
