@@ -222,6 +222,12 @@ func (at *AutoTrader) runCycle() error {
 	log.Printf("⏰ %s - AI决策周期 #%d", time.Now().Format("2006-01-02 15:04:05"), at.callCount)
 	log.Printf(strings.Repeat("=", 70))
 
+	// 检查15分钟K线是否走完
+	if !market.CheckKlineCompleteness() {
+		log.Printf("⏸ K线完整性检查：15分钟K线未走完，跳过本次决策")
+		return nil
+	}
+
 	// 创建决策记录
 	record := &logger.DecisionRecord{
 		ExecutionLog: []string{},
