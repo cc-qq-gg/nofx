@@ -70,12 +70,16 @@ func Get(symbol string) (*Data, error) {
 	if err != nil {
 		return nil, fmt.Errorf("获取4小时K线失败: %v", err)
 	}
+	// 过滤掉未走完的4小时K线
+	klines4h = filterCompletedKlines(klines4h)
 
 	// 获取15分钟K线数据 (用于计算MA15和当前价格)
 	klines15m, err := getKlines(symbol, "15m", 40)
 	if err != nil {
 		return nil, fmt.Errorf("获取15分钟K线失败: %v", err)
 	}
+	// 过滤掉未走完的15分钟K线
+	klines15m = filterCompletedKlines(klines15m)
 
 	// 计算当前指标 (基于15分钟最新数据)
 	currentPrice := klines15m[len(klines15m)-1].Close
@@ -565,6 +569,28 @@ func CheckKlineCompleteness() bool {
 	// 计算K线结束时间
 	klineEndTime := klineStartTime.Add(15 * time.Minute)
 
-	// 如果当前时间已经超过K线结束时间，说明K线已完成
-	return now.After(klineEndTime)
+	// 如果当前时间已经达到或超过K线结束时间，说明K线已完成
+	return now.Equal(klineEndTime) || now.After(klineEndTime)
+}
+
+// filterCompletedKlines 过滤掉未走完的K线
+// 返回只包含已收盘K线的数组
+func filterCompletedKlines(klines []Kline) []Kline {
+	if len(klines) == 0 {
+		return klines
+	}
+
+	// 获取当前时间戳（毫秒）
+	now := time.Now().UnixMilli()
+
+	// 过滤掉 CloseTime > now 的K线（未走完的K线）
+	completed := make([]Kline, 0, len(klines))
+	for _, k := range klines {
+		// 如果K线的收盘时间 <= 当前时间，说明K线已走完
+		if k.CloseTime <= now {
+			completed = append(completed, k)
+		}
+	}
+
+	return completed
 }
