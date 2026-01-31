@@ -21,7 +21,7 @@ module.exports = {
     },
     {
       name: 'nofx-frontend',
-      script: 'npm',
+      script: 'pnpm',
       args: 'run dev',
       cwd: path.join(__dirname, 'web'), // 动态拼接 web 目录
       instances: 1,
