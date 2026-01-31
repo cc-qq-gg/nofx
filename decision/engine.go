@@ -226,6 +226,23 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 		accountEquity*0.8, accountEquity*1.5, altcoinLeverage, accountEquity*5, accountEquity*10, btcEthLeverage))
 	sb.WriteString("4. **保证金**: 总使用率 ≤ 90%\n\n")
 
+	// === 趋势判断规则（MA21+MA15策略）===
+	sb.WriteString("# 📈 趋势判断规则（MA21+MA15策略）\n\n")
+	sb.WriteString("## 4小时趋势判断（使用MA21）\n\n")
+	sb.WriteString("- **连续3个MA21上涨** = 上涨趋势（MA21序列: t-3 < t-2 < t-1 < current）\n")
+	sb.WriteString("- **连续3个MA21下跌** = 下跌趋势（MA21序列: t-3 > t-2 > t-1 > current）\n")
+	sb.WriteString("- **MA21走平或震荡** = 观望，不开仓\n\n")
+	sb.WriteString("## 15分钟入场信号（使用MA15）\n\n")
+	sb.WriteString("- **上涨趋势**: 15分钟价格回调触及MA15时做多\n")
+	sb.WriteString("- **下跌趋势**: 15分钟价格反弹触及MA15时做空\n\n")
+	sb.WriteString("## 方向约束\n\n")
+	sb.WriteString("- **上涨趋势**: 只做多（open_long），不做空\n")
+	sb.WriteString("- **下跌趋势**: 只做空（open_short），不做多\n")
+	sb.WriteString("- **横盘震荡**: 观望（wait），不开新仓\n\n")
+	sb.WriteString("## 自定义止损止盈\n\n")
+	sb.WriteString("- **止损**: 入场价的1-2%（根据ATR动态调整）\n")
+	sb.WriteString("- **止盈**: 风险回报比≥1:3，目标3-6%收益\n\n")
+
 	// === 做空激励 ===
 	sb.WriteString("# 📉 做多做空平衡\n\n")
 	sb.WriteString("**重要**: 下跌趋势做空的利润 = 上涨趋势做多的利润\n\n")
@@ -325,9 +342,31 @@ func buildUserPrompt(ctx *Context) string {
 
 	// BTC 市场
 	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
-		sb.WriteString(fmt.Sprintf("**BTC**: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n\n",
+		// 判断趋势
+		trend := "横盘"
+		if len(btcData.MA21_4hSeries) >= 3 {
+			rising := true
+			falling := true
+			for i := 1; i < len(btcData.MA21_4hSeries); i++ {
+				if btcData.MA21_4hSeries[i] <= btcData.MA21_4hSeries[i-1] {
+					rising = false
+				}
+				if btcData.MA21_4hSeries[i] >= btcData.MA21_4hSeries[i-1] {
+					falling = false
+				}
+			}
+			if rising {
+				trend = "上涨"
+			} else if falling {
+				trend = "下跌"
+			}
+		}
+
+		sb.WriteString(fmt.Sprintf("**BTC**: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n",
 			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h,
 			btcData.CurrentMACD, btcData.CurrentRSI7))
+		sb.WriteString(fmt.Sprintf("MA21_4h: %.2f | 趋势: %s | MA15_15m: %.2f\n\n",
+			btcData.MA21_4h, trend, btcData.MA15_15m))
 	}
 
 	// 账户

@@ -23,6 +23,9 @@ type Data struct {
 	FundingRate       float64
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
+	MA21_4h           float64   // 4小时MA21
+	MA21_4hSeries     []float64 // 4小时MA21序列（最近3个，用于趋势判断）
+	MA15_15m          float64   // 15分钟MA15
 }
 
 // OIData Open Interest数据
@@ -63,6 +66,12 @@ type Kline struct {
 	CloseTime int64
 }
 
+// BinanceError Binance API错误响应结构
+type BinanceError struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+}
+
 // Get 获取指定代币的市场数据
 func Get(symbol string) (*Data, error) {
 	// 标准化symbol
@@ -78,6 +87,12 @@ func Get(symbol string) (*Data, error) {
 	klines4h, err := getKlines(symbol, "4h", 60) // 多获取用于计算指标
 	if err != nil {
 		return nil, fmt.Errorf("获取4小时K线失败: %v", err)
+	}
+
+	// 获取15分钟K线数据 (用于计算MA15)
+	klines15m, err := getKlines(symbol, "15m", 40)
+	if err != nil {
+		return nil, fmt.Errorf("获取15分钟K线失败: %v", err)
 	}
 
 	// 计算当前指标 (基于3分钟最新数据)
@@ -121,6 +136,20 @@ func Get(symbol string) (*Data, error) {
 	// 计算长期数据
 	longerTermData := calculateLongerTermData(klines4h)
 
+	// 计算MA21_4h (4小时21期简单移动平均线)
+	ma21_4h := calculateSMA(klines4h, 21)
+
+	// 计算MA21_4h序列（最近3个值，用于趋势判断）
+	ma21_4hSeries := make([]float64, 0, 3)
+	if len(klines4h) >= 23 { // 至少需要23根K线来计算3个MA21值
+		for i := len(klines4h) - 3; i < len(klines4h); i++ {
+			ma21_4hSeries = append(ma21_4hSeries, calculateSMA(klines4h[:i+1], 21))
+		}
+	}
+
+	// 计算MA15_15m (15分钟15期简单移动平均线)
+	ma15_15m := calculateSMA(klines15m, 15)
+
 	return &Data{
 		Symbol:            symbol,
 		CurrentPrice:      currentPrice,
@@ -133,6 +162,9 @@ func Get(symbol string) (*Data, error) {
 		FundingRate:       fundingRate,
 		IntradaySeries:    intradayData,
 		LongerTermContext: longerTermData,
+		MA21_4h:           ma21_4h,
+		MA21_4hSeries:     ma21_4hSeries,
+		MA15_15m:          ma15_15m,
 	}, nil
 }
 
@@ -152,9 +184,16 @@ func getKlines(symbol, interval string, limit int) ([]Kline, error) {
 		return nil, err
 	}
 
+	// Check if response is an error object first
+	var binanceErr BinanceError
+	if err := json.Unmarshal(body, &binanceErr); err == nil && binanceErr.Code != 0 {
+		return nil, fmt.Errorf("Binance API Error %d: %s", binanceErr.Code, binanceErr.Msg)
+	}
+
+	// Parse klines data if not an error
 	var rawData [][]interface{}
 	if err := json.Unmarshal(body, &rawData); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Failed to parse klines data: %v", err)
 	}
 
 	klines := make([]Kline, len(rawData))
@@ -201,6 +240,19 @@ func calculateEMA(klines []Kline, period int) float64 {
 	}
 
 	return ema
+}
+
+// calculateSMA 计算简单移动平均线(Simple Moving Average)
+func calculateSMA(klines []Kline, period int) float64 {
+	if len(klines) < period {
+		return 0
+	}
+
+	sum := 0.0
+	for i := len(klines) - period; i < len(klines); i++ {
+		sum += klines[i].Close
+	}
+	return sum / float64(period)
 }
 
 // calculateMACD 计算MACD
@@ -459,6 +511,23 @@ func Format(data *Data) string {
 	sb.WriteString(fmt.Sprintf("current_price = %.2f, current_ema20 = %.3f, current_macd = %.3f, current_rsi (7 period) = %.3f\n\n",
 		data.CurrentPrice, data.CurrentEMA20, data.CurrentMACD, data.CurrentRSI7))
 
+	// 添加MA21_4h和趋势信息
+	sb.WriteString(fmt.Sprintf("MA21_4h: %.2f\n", data.MA21_4h))
+	if len(data.MA21_4hSeries) >= 3 {
+		trend := "横盘"
+		if isRising(data.MA21_4hSeries) {
+			trend = "上涨"
+		} else if isFalling(data.MA21_4hSeries) {
+			trend = "下跌"
+		}
+		sb.WriteString(fmt.Sprintf("4小时趋势(MA21连续3): %s (序列: %s)\n", trend, formatFloatSlice(data.MA21_4hSeries)))
+	}
+
+	// 添加MA15_15m和价格距离
+	sb.WriteString(fmt.Sprintf("MA15_15m: %.2f\n", data.MA15_15m))
+	priceToMA15Dist := ((data.CurrentPrice - data.MA15_15m) / data.MA15_15m) * 100
+	sb.WriteString(fmt.Sprintf("价格与MA15_15m距离: %.2f%%\n\n", priceToMA15Dist))
+
 	sb.WriteString(fmt.Sprintf("In addition, here is the latest %s open interest and funding rate for perps:\n\n",
 		data.Symbol))
 
@@ -549,4 +618,30 @@ func parseFloat(v interface{}) (float64, error) {
 	default:
 		return 0, fmt.Errorf("unsupported type: %T", v)
 	}
+}
+
+// isRising 判断序列是否连续上升
+func isRising(series []float64) bool {
+	if len(series) < 2 {
+		return false
+	}
+	for i := 1; i < len(series); i++ {
+		if series[i] <= series[i-1] {
+			return false
+		}
+	}
+	return true
+}
+
+// isFalling 判断序列是否连续下降
+func isFalling(series []float64) bool {
+	if len(series) < 2 {
+		return false
+	}
+	for i := 1; i < len(series); i++ {
+		if series[i] >= series[i-1] {
+			return false
+		}
+	}
+	return true
 }
