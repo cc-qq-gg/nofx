@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/adshao/go-binance/v2/futures"
+	"github.com/adshao/go-binance/v2/portfolio"
 )
 
 // FuturesTrader 币安合约交易器
 type FuturesTrader struct {
-	client *futures.Client
+	client          *futures.Client
+	portfolioClient *portfolio.Client
 
 	// 余额缓存
 	cachedBalance     map[string]interface{}
@@ -33,9 +35,11 @@ type FuturesTrader struct {
 // NewFuturesTrader 创建合约交易器
 func NewFuturesTrader(apiKey, secretKey string) *FuturesTrader {
 	client := futures.NewClient(apiKey, secretKey)
+	portfolioClient := portfolio.NewClient(apiKey, secretKey)
 	return &FuturesTrader{
-		client:        client,
-		cacheDuration: 15 * time.Second, // 15秒缓存
+		client:          client,
+		portfolioClient: portfolioClient,
+		cacheDuration:   15 * time.Second, // 15秒缓存
 	}
 }
 
@@ -467,77 +471,91 @@ func (t *FuturesTrader) CalculatePositionSize(balance, riskPercent, price float6
 
 // SetStopLoss 设置止损单
 func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity, stopPrice float64) error {
-	var side futures.SideType
-	var posSide futures.PositionSideType
+	var side portfolio.SideType
+	var posSide portfolio.PositionSideType
 
 	if positionSide == "LONG" {
-		side = futures.SideTypeSell
-		posSide = futures.PositionSideTypeLong
+		side = portfolio.SideTypeSell
+		posSide = portfolio.PositionSideTypeLong
 	} else {
-		side = futures.SideTypeBuy
-		posSide = futures.PositionSideTypeShort
+		side = portfolio.SideTypeBuy
+		posSide = portfolio.PositionSideTypeShort
 	}
 
-	// 格式化数量
 	quantityStr, err := t.FormatQuantity(symbol, quantity)
 	if err != nil {
 		return err
 	}
+	stopPriceStr, err := t.formatTriggerPrice(symbol, positionSide, stopPrice, true)
+	if err != nil {
+		return err
+	}
 
-	_, err = t.client.NewCreateOrderService().
+	log.Printf("🛡 提交止损条件单: symbol=%s side=%s positionSide=%s quantity=%s stopPrice=%s endpoint=/papi/v1/um/conditional/order",
+		symbol, side, posSide, quantityStr, stopPriceStr)
+
+	order, err := t.portfolioClient.NewUMConditionalOrderService().
 		Symbol(symbol).
 		Side(side).
 		PositionSide(posSide).
-		Type(futures.OrderTypeStopMarket).
-		StopPrice(fmt.Sprintf("%.8f", stopPrice)).
+		StrategyType(string(portfolio.StrategyTypeStopMarket)).
 		Quantity(quantityStr).
-		WorkingType(futures.WorkingTypeContractPrice).
-		ClosePosition(true).
+		StopPrice(stopPriceStr).
+		WorkingType(string(portfolio.WorkingTypeContractPrice)).
+		PriceProtect(false).
 		Do(context.Background())
 
 	if err != nil {
 		return fmt.Errorf("设置止损失败: %w", err)
 	}
 
-	log.Printf("  止损价设置: %.4f", stopPrice)
+	log.Printf("✅ 止损条件单已提交: symbol=%s strategyId=%d status=%s type=%s stopPrice=%s origQty=%s",
+		order.Symbol, order.StrategyId, order.StrategyStatus, order.StrategyType, order.StopPrice, order.OrigQty)
 	return nil
 }
 
 // SetTakeProfit 设置止盈单
 func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quantity, takeProfitPrice float64) error {
-	var side futures.SideType
-	var posSide futures.PositionSideType
+	var side portfolio.SideType
+	var posSide portfolio.PositionSideType
 
 	if positionSide == "LONG" {
-		side = futures.SideTypeSell
-		posSide = futures.PositionSideTypeLong
+		side = portfolio.SideTypeSell
+		posSide = portfolio.PositionSideTypeLong
 	} else {
-		side = futures.SideTypeBuy
-		posSide = futures.PositionSideTypeShort
+		side = portfolio.SideTypeBuy
+		posSide = portfolio.PositionSideTypeShort
 	}
 
-	// 格式化数量
 	quantityStr, err := t.FormatQuantity(symbol, quantity)
 	if err != nil {
 		return err
 	}
+	takeProfitPriceStr, err := t.formatTriggerPrice(symbol, positionSide, takeProfitPrice, false)
+	if err != nil {
+		return err
+	}
 
-	_, err = t.client.NewCreateOrderService().
+	log.Printf("🎯 提交止盈条件单: symbol=%s side=%s positionSide=%s quantity=%s stopPrice=%s endpoint=/papi/v1/um/conditional/order",
+		symbol, side, posSide, quantityStr, takeProfitPriceStr)
+
+	order, err := t.portfolioClient.NewUMConditionalOrderService().
 		Symbol(symbol).
 		Side(side).
 		PositionSide(posSide).
-		Type(futures.OrderTypeTakeProfitMarket).
-		StopPrice(fmt.Sprintf("%.8f", takeProfitPrice)).
+		StrategyType(string(portfolio.StrategyTypeTakeProfitMarket)).
 		Quantity(quantityStr).
-		WorkingType(futures.WorkingTypeContractPrice).
-		ClosePosition(true).
+		StopPrice(takeProfitPriceStr).
+		WorkingType(string(portfolio.WorkingTypeContractPrice)).
+		PriceProtect(false).
 		Do(context.Background())
 
 	if err != nil {
 		return fmt.Errorf("设置止盈失败: %w", err)
 	}
 
-	log.Printf("  止盈价设置: %.4f", takeProfitPrice)
+	log.Printf("✅ 止盈条件单已提交: symbol=%s strategyId=%d status=%s type=%s stopPrice=%s origQty=%s",
+		order.Symbol, order.StrategyId, order.StrategyStatus, order.StrategyType, order.StopPrice, order.OrigQty)
 	return nil
 }
 
@@ -783,6 +801,21 @@ func (t *FuturesTrader) FormatPriceForSide(symbol string, price float64, roundUp
 
 	format := fmt.Sprintf("%%.%df", precision)
 	return fmt.Sprintf(format, normalized/scale), nil
+}
+
+func (t *FuturesTrader) formatTriggerPrice(symbol string, positionSide string, price float64, isStopLoss bool) (string, error) {
+	roundUp := false
+	switch {
+	case positionSide == "LONG" && isStopLoss:
+		roundUp = false
+	case positionSide == "LONG" && !isStopLoss:
+		roundUp = true
+	case positionSide == "SHORT" && isStopLoss:
+		roundUp = true
+	case positionSide == "SHORT" && !isStopLoss:
+		roundUp = false
+	}
+	return t.FormatPriceForSide(symbol, price, roundUp)
 }
 
 // 辅助函数
