@@ -14,10 +14,16 @@ type Server struct {
 	router        *gin.Engine
 	traderManager *manager.TraderManager
 	port          int
+	nonces        *nonceStore
+	httpsEnabled  bool
+	tlsAutoGen    bool
+	tlsHosts      []string
+	tlsCertFile   string
+	tlsKeyFile    string
 }
 
 // NewServer 创建API服务器
-func NewServer(traderManager *manager.TraderManager, port int) *Server {
+func NewServer(traderManager *manager.TraderManager, port int, httpsEnabled, tlsAutoGen bool, tlsHosts []string, tlsCertFile, tlsKeyFile string) *Server {
 	// 设置为Release模式（减少日志输出）
 	gin.SetMode(gin.ReleaseMode)
 
@@ -30,6 +36,12 @@ func NewServer(traderManager *manager.TraderManager, port int) *Server {
 		router:        router,
 		traderManager: traderManager,
 		port:          port,
+		nonces:        newNonceStore(),
+		httpsEnabled:  httpsEnabled,
+		tlsAutoGen:    tlsAutoGen,
+		tlsHosts:      tlsHosts,
+		tlsCertFile:   tlsCertFile,
+		tlsKeyFile:    tlsKeyFile,
 	}
 
 	// 设置路由
@@ -77,6 +89,7 @@ func (s *Server) setupRoutes() {
 		api.GET("/statistics", s.handleStatistics)
 		api.GET("/equity-history", s.handleEquityHistory)
 		api.GET("/performance", s.handlePerformance)
+		api.POST("/risk/order", s.handleRiskOrder)
 	}
 }
 
@@ -404,7 +417,11 @@ func (s *Server) handlePerformance(c *gin.Context) {
 // Start 启动服务器
 func (s *Server) Start() error {
 	addr := fmt.Sprintf(":%d", s.port)
-	log.Printf("🌐 API服务器启动在 http://localhost%s", addr)
+	scheme := "http"
+	if s.httpsEnabled {
+		scheme = "https"
+	}
+	log.Printf("🌐 API服务器启动在 %s://localhost%s", scheme, addr)
 	log.Printf("📊 API文档:")
 	log.Printf("  • GET  /api/competition      - 竞赛总览（对比所有trader）")
 	log.Printf("  • GET  /api/traders          - Trader列表")
@@ -416,8 +433,20 @@ func (s *Server) Start() error {
 	log.Printf("  • GET  /api/statistics?trader_id=xxx - 指定trader的统计信息")
 	log.Printf("  • GET  /api/equity-history?trader_id=xxx - 指定trader的收益率历史数据")
 	log.Printf("  • GET  /api/performance?trader_id=xxx - 指定trader的AI学习表现分析")
+	log.Printf("  • POST /api/risk/order?trader_id=xxx - 手动风控下单（HMAC签名）")
 	log.Printf("  • GET  /health               - 健康检查")
 	log.Println()
+
+	if s.httpsEnabled {
+		log.Printf("🔐 HTTPS已启用，证书: %s", s.tlsCertFile)
+		if s.tlsAutoGen {
+			if err := ensureTLSFiles(s.tlsCertFile, s.tlsKeyFile, s.tlsHosts); err != nil {
+				return err
+			}
+			log.Printf("🔑 已检查/生成TLS证书和私钥")
+		}
+		return s.router.RunTLS(addr, s.tlsCertFile, s.tlsKeyFile)
+	}
 
 	return s.router.Run(addr)
 }

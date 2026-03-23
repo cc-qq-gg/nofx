@@ -11,7 +11,7 @@ import (
 type TraderConfig struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
-	Enabled bool   `json:"enabled"` // 是否启用该trader
+	Enabled bool   `json:"enabled"`  // 是否启用该trader
 	AIModel string `json:"ai_model"` // "qwen" or "deepseek"
 
 	// 交易平台选择（二选一）
@@ -40,6 +40,10 @@ type TraderConfig struct {
 	CustomAPIKey    string `json:"custom_api_key,omitempty"`
 	CustomModelName string `json:"custom_model_name,omitempty"`
 
+	// 手动风控下单接口认证
+	RiskAPIKey    string `json:"risk_api_key,omitempty"`
+	RiskAPISecret string `json:"risk_api_secret,omitempty"`
+
 	InitialBalance      float64 `json:"initial_balance"`
 	ScanIntervalMinutes int     `json:"scan_interval_minutes"`
 }
@@ -58,6 +62,11 @@ type Config struct {
 	CoinPoolAPIURL     string         `json:"coin_pool_api_url"`
 	OITopAPIURL        string         `json:"oi_top_api_url"`
 	APIServerPort      int            `json:"api_server_port"`
+	APIServerHTTPS     bool           `json:"api_server_https"`
+	APITLSAutoGenerate bool           `json:"api_tls_auto_generate"`
+	APITLSHosts        []string       `json:"api_tls_hosts"`
+	APITLSCertFile     string         `json:"api_tls_cert_file"`
+	APITLSKeyFile      string         `json:"api_tls_key_file"`
 	MaxDailyLoss       float64        `json:"max_daily_loss"`
 	MaxDrawdown        float64        `json:"max_drawdown"`
 	StopTradingMinutes int            `json:"stop_trading_minutes"`
@@ -176,6 +185,23 @@ func (c *Config) Validate() error {
 
 	if c.APIServerPort <= 0 {
 		c.APIServerPort = 8080 // 默认8080端口
+	}
+	if c.APIServerHTTPS {
+		if len(c.APITLSHosts) == 0 {
+			c.APITLSHosts = []string{"localhost", "127.0.0.1", "::1"}
+		}
+		if c.APITLSCertFile == "" {
+			c.APITLSCertFile = "certs/server-cert.pem"
+		}
+		if c.APITLSKeyFile == "" {
+			c.APITLSKeyFile = "certs/server-key.pem"
+		}
+		if !c.APITLSAutoGenerate && c.APITLSCertFile == "" {
+			return fmt.Errorf("启用api_server_https时必须配置api_tls_cert_file")
+		}
+		if !c.APITLSAutoGenerate && c.APITLSKeyFile == "" {
+			return fmt.Errorf("启用api_server_https时必须配置api_tls_key_file")
+		}
 	}
 
 	// 设置杠杆默认值（适配币安子账户限制，最大5倍）

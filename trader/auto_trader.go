@@ -49,6 +49,10 @@ type AutoTraderConfig struct {
 	CustomAPIKey    string
 	CustomModelName string
 
+	// 手动风控下单接口认证
+	RiskAPIKey    string
+	RiskAPISecret string
+
 	// 扫描配置
 	ScanInterval time.Duration // 扫描间隔（建议3分钟）
 
@@ -218,9 +222,9 @@ func (at *AutoTrader) Stop() {
 func (at *AutoTrader) runCycle() error {
 	at.callCount++
 
-	log.Printf("\n" + strings.Repeat("=", 70))
+	log.Print("\n" + strings.Repeat("=", 70))
 	log.Printf("⏰ %s - AI决策周期 #%d", time.Now().Format("2006-01-02 15:04:05"), at.callCount)
-	log.Printf(strings.Repeat("=", 70))
+	log.Print(strings.Repeat("=", 70))
 
 	// 检查15分钟K线是否走完
 	if !market.CheckKlineCompleteness() {
@@ -311,11 +315,11 @@ func (at *AutoTrader) runCycle() error {
 
 		// 打印AI思维链（即使有错误）
 		if decision != nil && decision.CoTTrace != "" {
-			log.Printf("\n" + strings.Repeat("-", 70))
+			log.Print("\n" + strings.Repeat("-", 70))
 			log.Println("💭 AI思维链分析（错误情况）:")
 			log.Println(strings.Repeat("-", 70))
 			log.Println(decision.CoTTrace)
-			log.Printf(strings.Repeat("-", 70) + "\n")
+			log.Print(strings.Repeat("-", 70) + "\n")
 		}
 
 		at.decisionLogger.LogDecision(record)
@@ -323,11 +327,11 @@ func (at *AutoTrader) runCycle() error {
 	}
 
 	// 5. 打印AI思维链
-	log.Printf("\n" + strings.Repeat("-", 70))
+	log.Print("\n" + strings.Repeat("-", 70))
 	log.Println("💭 AI思维链分析:")
 	log.Println(strings.Repeat("-", 70))
 	log.Println(decision.CoTTrace)
-	log.Printf(strings.Repeat("-", 70) + "\n")
+	log.Print(strings.Repeat("-", 70) + "\n")
 
 	// 6. 打印AI决策
 	log.Printf("📋 AI决策列表 (%d 个):\n", len(decision.Decisions))
@@ -768,6 +772,200 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 		"last_reset_time": at.lastResetTime.Format(time.RFC3339),
 		"ai_provider":     aiProvider,
 	}
+}
+
+// ValidateRiskRequest 验证风控下单请求签名
+func (at *AutoTrader) ValidateRiskRequest(method, path, apiKey, timestamp, nonce, signature string, body []byte) error {
+	if at.config.RiskAPIKey == "" || at.config.RiskAPISecret == "" {
+		return fmt.Errorf("该trader未配置risk_api_key/risk_api_secret")
+	}
+	if apiKey != at.config.RiskAPIKey {
+		return fmt.Errorf("API Key无效")
+	}
+	if nonce == "" {
+		return fmt.Errorf("nonce不能为空")
+	}
+	if err := ValidateRiskTimestamp(timestamp, time.Now()); err != nil {
+		return err
+	}
+
+	expected := ComputeRiskRequestSignature(at.config.RiskAPISecret, method, path, timestamp, nonce, body)
+	if !strings.EqualFold(signature, expected) {
+		return fmt.Errorf("signature无效")
+	}
+	return nil
+}
+
+// ExecuteRiskOrder 执行手动风控下单
+func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderResponse, error) {
+	side, err := NormalizeRiskSide(req.Side)
+	if err != nil {
+		return nil, err
+	}
+
+	binanceTrader, ok := at.trader.(*FuturesTrader)
+	if !ok {
+		return nil, fmt.Errorf("当前trader仅支持币安风控下单接口")
+	}
+
+	account, err := at.GetAccountInfo()
+	if err != nil {
+		return nil, fmt.Errorf("获取账户信息失败: %w", err)
+	}
+
+	equity, _ := account["total_equity"].(float64)
+	availableBalance, _ := account["available_balance"].(float64)
+	if equity <= 0 {
+		return nil, fmt.Errorf("账户净值无效")
+	}
+
+	if err := at.ensureNoSymbolPosition(req.Symbol); err != nil {
+		return nil, err
+	}
+
+	bestBid, bestAsk, err := binanceTrader.GetBestBidAsk(req.Symbol)
+	if err != nil {
+		return nil, fmt.Errorf("获取盘口失败: %w", err)
+	}
+
+	referencePrice := bestAsk
+	if side == "SHORT" {
+		referencePrice = bestBid
+	}
+	if referencePrice <= 0 {
+		return nil, fmt.Errorf("参考价格无效")
+	}
+
+	structuralStopRatio, err := calculateStructuralStopRatio(req.Symbol, side, referencePrice)
+	if err != nil {
+		return nil, err
+	}
+
+	calc, err := CalculateRiskOrder(RiskOrderCalcInput{
+		Equity:              equity,
+		ReferencePrice:      referencePrice,
+		StructuralStopRatio: structuralStopRatio,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if calc.Margin > availableBalance {
+		return nil, fmt.Errorf("所需保证金%.4f超过可用余额%.4f", calc.Margin, availableBalance)
+	}
+
+	entryOrderPrice := referencePrice * (1 + riskEntryOffsetRatio)
+	if side == "SHORT" {
+		entryOrderPrice = referencePrice * (1 - riskEntryOffsetRatio)
+	}
+
+	orderResult, err := binanceTrader.PlaceAggressiveRiskEntry(req.Symbol, side, calc.Quantity, riskFixedLeverage, entryOrderPrice)
+	if err != nil {
+		return nil, err
+	}
+
+	filledQuantity, _ := orderResult["executedQty"].(float64)
+	avgFillPrice, _ := orderResult["avgPrice"].(float64)
+	orderID, _ := orderResult["orderId"].(int64)
+
+	if filledQuantity <= 0 || avgFillPrice <= 0 {
+		return &RiskOrderResponse{
+			Accepted:                false,
+			RejectReason:            "IOC订单未成交",
+			TraderID:                at.id,
+			Symbol:                  req.Symbol,
+			Side:                    side,
+			Equity:                  equity,
+			MaxLossAmount:           calc.MaxLossAmount,
+			ReferencePrice:          referencePrice,
+			EntryOrderPrice:         entryOrderPrice,
+			StructuralStopLossRatio: calc.StructuralStopLossRatio,
+			ActualStopLossRatio:     calc.ActualStopLossRatio,
+			Margin:                  calc.Margin,
+			Notional:                calc.Notional,
+			PositionMultiple:        calc.PositionMultiple,
+			Quantity:                calc.Quantity,
+			Leverage:                riskFixedLeverage,
+			OrderID:                 orderID,
+		}, nil
+	}
+
+	stopLossPrice := avgFillPrice * (1 - calc.ActualStopLossRatio)
+	takeProfitPrice := avgFillPrice * (1 + riskTakeProfitRatio)
+	if side == "SHORT" {
+		stopLossPrice = avgFillPrice * (1 + calc.ActualStopLossRatio)
+		takeProfitPrice = avgFillPrice * (1 - riskTakeProfitRatio)
+	}
+
+	stopPlaced := true
+	if err := at.trader.SetStopLoss(req.Symbol, side, filledQuantity, stopLossPrice); err != nil {
+		stopPlaced = false
+		log.Printf("⚠ 风控下单后设置止损失败: %v", err)
+	}
+
+	tpPlaced := true
+	if err := at.trader.SetTakeProfit(req.Symbol, side, filledQuantity, takeProfitPrice); err != nil {
+		tpPlaced = false
+		log.Printf("⚠ 风控下单后设置止盈失败: %v", err)
+	}
+
+	return &RiskOrderResponse{
+		Accepted:                true,
+		TraderID:                at.id,
+		Symbol:                  req.Symbol,
+		Side:                    side,
+		Equity:                  equity,
+		MaxLossAmount:           calc.MaxLossAmount,
+		ReferencePrice:          referencePrice,
+		EntryPrice:              avgFillPrice,
+		EntryOrderPrice:         entryOrderPrice,
+		StopLossPrice:           stopLossPrice,
+		TakeProfitPrice:         takeProfitPrice,
+		StructuralStopLossRatio: calc.StructuralStopLossRatio,
+		ActualStopLossRatio:     calc.ActualStopLossRatio,
+		Margin:                  calc.Margin,
+		Notional:                calc.Notional,
+		PositionMultiple:        calc.PositionMultiple,
+		Quantity:                calc.Quantity,
+		FilledQuantity:          filledQuantity,
+		Leverage:                riskFixedLeverage,
+		OrderID:                 orderID,
+		StopOrderPlaced:         stopPlaced,
+		TakeProfitOrderPlaced:   tpPlaced,
+	}, nil
+}
+
+func (at *AutoTrader) ensureNoSymbolPosition(symbol string) error {
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return fmt.Errorf("获取持仓失败: %w", err)
+	}
+	for _, pos := range positions {
+		if pos["symbol"] == symbol {
+			return fmt.Errorf("%s 当前已有持仓，拒绝重复开仓", symbol)
+		}
+	}
+	return nil
+}
+
+func calculateStructuralStopRatio(symbol, side string, referencePrice float64) (float64, error) {
+	currentKline, err := market.GetCurrentKline(symbol, riskOrderTimeframe)
+	if err != nil {
+		return 0, fmt.Errorf("获取当前15m K线失败: %w", err)
+	}
+
+	if side == "LONG" {
+		lowestLow := currentKline.Low
+		if lowestLow <= 0 || lowestLow >= referencePrice {
+			return 0, nil
+		}
+		return (referencePrice - lowestLow) / referencePrice, nil
+	}
+
+	highestHigh := currentKline.High
+	if highestHigh <= referencePrice {
+		return 0, nil
+	}
+	return (highestHigh - referencePrice) / referencePrice, nil
 }
 
 // GetAccountInfo 获取账户信息（用于API）

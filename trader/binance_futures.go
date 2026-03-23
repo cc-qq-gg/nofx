@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -200,6 +201,27 @@ func (t *FuturesTrader) SetMarginType(symbol string, marginType futures.MarginTy
 	time.Sleep(3 * time.Second)
 
 	return nil
+}
+
+// GetBestBidAsk 获取盘口一档
+func (t *FuturesTrader) GetBestBidAsk(symbol string) (float64, float64, error) {
+	book, err := t.client.NewListBookTickersService().Symbol(symbol).Do(context.Background())
+	if err != nil {
+		return 0, 0, fmt.Errorf("获取盘口失败: %w", err)
+	}
+	if len(book) == 0 {
+		return 0, 0, fmt.Errorf("未找到盘口")
+	}
+
+	bid, err := strconv.ParseFloat(book[0].BidPrice, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	ask, err := strconv.ParseFloat(book[0].AskPrice, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	return bid, ask, nil
 }
 
 // OpenLong 开多仓
@@ -519,6 +541,60 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 	return nil
 }
 
+// PlaceAggressiveRiskEntry 按激进限价IOC下单
+func (t *FuturesTrader) PlaceAggressiveRiskEntry(symbol string, positionSide string, quantity float64, leverage int, limitPrice float64) (map[string]interface{}, error) {
+	if err := t.SetLeverage(symbol, leverage); err != nil {
+		return nil, err
+	}
+	if err := t.SetMarginType(symbol, futures.MarginTypeIsolated); err != nil {
+		return nil, err
+	}
+
+	quantityStr, err := t.FormatQuantityDown(symbol, quantity)
+	if err != nil {
+		return nil, err
+	}
+	if quantityStr == "0" || quantityStr == "0.0" || quantityStr == "0.00" || quantityStr == "0.000" {
+		return nil, fmt.Errorf("下单数量过小")
+	}
+
+	priceStr, err := t.FormatPriceForSide(symbol, limitPrice, positionSide == "LONG")
+	if err != nil {
+		return nil, err
+	}
+
+	side := futures.SideTypeBuy
+	posSide := futures.PositionSideTypeLong
+	if positionSide == "SHORT" {
+		side = futures.SideTypeSell
+		posSide = futures.PositionSideTypeShort
+	}
+
+	order, err := t.client.NewCreateOrderService().
+		Symbol(symbol).
+		Side(side).
+		PositionSide(posSide).
+		Type(futures.OrderTypeLimit).
+		TimeInForce(futures.TimeInForceTypeIOC).
+		Price(priceStr).
+		Quantity(quantityStr).
+		Do(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("下单失败: %w", err)
+	}
+
+	result := make(map[string]interface{})
+	result["orderId"] = order.OrderID
+	result["symbol"] = order.Symbol
+	result["status"] = order.Status
+
+	executedQty, _ := strconv.ParseFloat(order.ExecutedQuantity, 64)
+	avgPrice, _ := strconv.ParseFloat(order.AvgPrice, 64)
+	result["executedQty"] = executedQty
+	result["avgPrice"] = avgPrice
+	return result, nil
+}
+
 // GetSymbolPrecision 获取交易对的数量精度
 func (t *FuturesTrader) GetSymbolPrecision(symbol string) (int, error) {
 	exchangeInfo, err := t.client.NewExchangeInfoService().Do(context.Background())
@@ -542,6 +618,28 @@ func (t *FuturesTrader) GetSymbolPrecision(symbol string) (int, error) {
 
 	log.Printf("  ⚠ %s 未找到精度信息，使用默认精度3", symbol)
 	return 3, nil // 默认精度为3
+}
+
+// GetSymbolPricePrecision 获取交易对的价格精度
+func (t *FuturesTrader) GetSymbolPricePrecision(symbol string) (int, error) {
+	exchangeInfo, err := t.client.NewExchangeInfoService().Do(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("获取交易规则失败: %w", err)
+	}
+
+	for _, s := range exchangeInfo.Symbols {
+		if s.Symbol != symbol {
+			continue
+		}
+		for _, filter := range s.Filters {
+			if filter["filterType"] == "PRICE_FILTER" {
+				tickSize := filter["tickSize"].(string)
+				return calculatePrecision(tickSize), nil
+			}
+		}
+	}
+
+	return 2, nil
 }
 
 // calculatePrecision 从stepSize计算精度
@@ -597,6 +695,38 @@ func (t *FuturesTrader) FormatQuantity(symbol string, quantity float64) (string,
 
 	format := fmt.Sprintf("%%.%df", precision)
 	return fmt.Sprintf(format, quantity), nil
+}
+
+// FormatQuantityDown 向下裁剪数量，避免超风险
+func (t *FuturesTrader) FormatQuantityDown(symbol string, quantity float64) (string, error) {
+	precision, err := t.GetSymbolPrecision(symbol)
+	if err != nil {
+		precision = 3
+	}
+
+	scale := math.Pow10(precision)
+	normalized := math.Floor(quantity*scale) / scale
+	format := fmt.Sprintf("%%.%df", precision)
+	return fmt.Sprintf(format, normalized), nil
+}
+
+// FormatPriceForSide 根据方向格式化价格
+func (t *FuturesTrader) FormatPriceForSide(symbol string, price float64, roundUp bool) (string, error) {
+	precision, err := t.GetSymbolPricePrecision(symbol)
+	if err != nil {
+		precision = 2
+	}
+
+	scale := math.Pow10(precision)
+	normalized := price * scale
+	if roundUp {
+		normalized = math.Ceil(normalized)
+	} else {
+		normalized = math.Floor(normalized)
+	}
+
+	format := fmt.Sprintf("%%.%df", precision)
+	return fmt.Sprintf(format, normalized/scale), nil
 }
 
 // 辅助函数

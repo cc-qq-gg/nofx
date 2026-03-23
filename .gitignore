@@ -39,3 +39,5 @@ web/dist/
 web/.vite/
 config.json
 CLAUDE.md
+AGENTS.md
+scripts/
