@@ -154,8 +154,8 @@ func main() {
 		log.Println("📛 收到退出信号，正在停止API服务...")
 	} else {
 		log.Println("📛 收到退出信号，正在停止所有trader...")
-		traderManager.StopAll()
 	}
+	traderManager.StopAll()
 
 	fmt.Println()
 	fmt.Println("👋 感谢使用AI交易竞赛系统！")

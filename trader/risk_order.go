@@ -51,6 +51,8 @@ type RiskOrderResponse struct {
 	OrderID                 int64   `json:"order_id,omitempty"`
 	StopOrderPlaced         bool    `json:"stop_order_placed"`
 	TakeProfitOrderPlaced   bool    `json:"take_profit_order_placed"`
+	ProtectionMode          string  `json:"protection_mode,omitempty"`
+	ProtectionTaskID        string  `json:"protection_task_id,omitempty"`
 }
 
 func NormalizeRiskSide(side string) (string, error) {

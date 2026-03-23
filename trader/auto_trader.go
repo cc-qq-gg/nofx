@@ -10,6 +10,7 @@ import (
 	"nofx/mcp"
 	"nofx/pool"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -87,6 +88,19 @@ type AutoTrader struct {
 	startTime             time.Time        // 系统启动时间
 	callCount             int              // AI调用次数
 	positionFirstSeenTime map[string]int64 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+	protectionMu          sync.Mutex
+	protectionTasks       map[string]contextProtectionTask
+}
+
+type contextProtectionTask struct {
+	ID              string
+	Symbol          string
+	Side            string
+	Quantity        float64
+	EntryPrice      float64
+	StopLossPrice   float64
+	TakeProfitPrice float64
+	CreatedAt       time.Time
 }
 
 // NewAutoTrader 创建自动交易器
@@ -181,6 +195,7 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 		callCount:             0,
 		isRunning:             false,
 		positionFirstSeenTime: make(map[string]int64),
+		protectionTasks:       make(map[string]contextProtectionTask),
 	}, nil
 }
 
@@ -215,6 +230,7 @@ func (at *AutoTrader) Run() error {
 // Stop 停止自动交易
 func (at *AutoTrader) Stop() {
 	at.isRunning = false
+	at.clearProtectionTasks()
 	log.Println("⏹ 自动交易系统停止")
 }
 
@@ -909,17 +925,37 @@ func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderRespons
 	log.Printf("🛡 保护单参数: symbol=%s side=%s filledQty=%.8f avgPrice=%.8f stopLoss=%.8f takeProfit=%.8f",
 		req.Symbol, side, filledQuantity, avgFillPrice, stopLossPrice, takeProfitPrice)
 
-	stopPlaced := true
-	if err := at.trader.SetStopLoss(req.Symbol, side, filledQuantity, stopLossPrice); err != nil {
-		stopPlaced = false
-		log.Printf("⚠ 风控下单后设置止损失败: %v", err)
+	taskID, err := at.registerLocalProtection(req.Symbol, side, filledQuantity, avgFillPrice, stopLossPrice, takeProfitPrice)
+	if err != nil {
+		log.Printf("⚠ 风控下单后注册本地保护任务失败: %v", err)
+		return &RiskOrderResponse{
+			Accepted:                true,
+			TraderID:                at.id,
+			Symbol:                  req.Symbol,
+			Side:                    side,
+			Equity:                  equity,
+			MaxLossAmount:           calc.MaxLossAmount,
+			ReferencePrice:          referencePrice,
+			EntryPrice:              avgFillPrice,
+			EntryOrderPrice:         entryOrderPrice,
+			StopLossPrice:           stopLossPrice,
+			TakeProfitPrice:         takeProfitPrice,
+			StructuralStopLossRatio: calc.StructuralStopLossRatio,
+			ActualStopLossRatio:     calc.ActualStopLossRatio,
+			Margin:                  calc.Margin,
+			Notional:                calc.Notional,
+			PositionMultiple:        calc.PositionMultiple,
+			Quantity:                calc.Quantity,
+			FilledQuantity:          filledQuantity,
+			Leverage:                riskFixedLeverage,
+			OrderID:                 orderID,
+			StopOrderPlaced:         false,
+			TakeProfitOrderPlaced:   false,
+			ProtectionMode:          "local_monitor",
+		}, nil
 	}
-
-	tpPlaced := true
-	if err := at.trader.SetTakeProfit(req.Symbol, side, filledQuantity, takeProfitPrice); err != nil {
-		tpPlaced = false
-		log.Printf("⚠ 风控下单后设置止盈失败: %v", err)
-	}
+	log.Printf("✅ 本地保护任务已注册: taskId=%s symbol=%s side=%s quantity=%.8f stopLoss=%.8f takeProfit=%.8f",
+		taskID, req.Symbol, side, filledQuantity, stopLossPrice, takeProfitPrice)
 
 	return &RiskOrderResponse{
 		Accepted:                true,
@@ -942,9 +978,135 @@ func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderRespons
 		FilledQuantity:          filledQuantity,
 		Leverage:                riskFixedLeverage,
 		OrderID:                 orderID,
-		StopOrderPlaced:         stopPlaced,
-		TakeProfitOrderPlaced:   tpPlaced,
+		StopOrderPlaced:         true,
+		TakeProfitOrderPlaced:   true,
+		ProtectionMode:          "local_monitor",
+		ProtectionTaskID:        taskID,
 	}, nil
+}
+
+func (at *AutoTrader) registerLocalProtection(symbol, side string, quantity, entryPrice, stopLossPrice, takeProfitPrice float64) (string, error) {
+	if quantity <= 0 {
+		return "", fmt.Errorf("保护数量必须大于0")
+	}
+
+	taskID := fmt.Sprintf("%s-%s-%d", at.id, strings.ToLower(symbol), time.Now().UnixNano())
+	task := contextProtectionTask{
+		ID:              taskID,
+		Symbol:          symbol,
+		Side:            side,
+		Quantity:        quantity,
+		EntryPrice:      entryPrice,
+		StopLossPrice:   stopLossPrice,
+		TakeProfitPrice: takeProfitPrice,
+		CreatedAt:       time.Now(),
+	}
+
+	at.protectionMu.Lock()
+	at.protectionTasks[taskID] = task
+	at.protectionMu.Unlock()
+
+	go at.runLocalProtection(task)
+	return taskID, nil
+}
+
+func (at *AutoTrader) runLocalProtection(task contextProtectionTask) {
+	log.Printf("🛰 本地保护任务启动: taskId=%s symbol=%s side=%s quantity=%.8f entry=%.8f stopLoss=%.8f takeProfit=%.8f",
+		task.ID, task.Symbol, task.Side, task.Quantity, task.EntryPrice, task.StopLossPrice, task.TakeProfitPrice)
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	pollCount := 0
+	for range ticker.C {
+		if !at.hasProtectionTask(task.ID) {
+			return
+		}
+
+		price, err := at.trader.GetMarketPrice(task.Symbol)
+		if err != nil {
+			log.Printf("⚠ 本地保护任务取价失败: taskId=%s symbol=%s err=%v", task.ID, task.Symbol, err)
+			continue
+		}
+
+		pollCount++
+		if pollCount == 1 || pollCount%15 == 0 {
+			log.Printf("📡 本地保护巡检: taskId=%s symbol=%s side=%s price=%.8f stopLoss=%.8f takeProfit=%.8f",
+				task.ID, task.Symbol, task.Side, price, task.StopLossPrice, task.TakeProfitPrice)
+		}
+
+		triggerReason := ""
+		switch task.Side {
+		case "LONG":
+			if price <= task.StopLossPrice {
+				triggerReason = "stop_loss"
+			} else if price >= task.TakeProfitPrice {
+				triggerReason = "take_profit"
+			}
+		case "SHORT":
+			if price >= task.StopLossPrice {
+				triggerReason = "stop_loss"
+			} else if price <= task.TakeProfitPrice {
+				triggerReason = "take_profit"
+			}
+		default:
+			log.Printf("⚠ 本地保护任务方向无效: taskId=%s side=%s", task.ID, task.Side)
+			at.removeProtectionTask(task.ID)
+			return
+		}
+
+		if triggerReason == "" {
+			continue
+		}
+
+		log.Printf("🚨 本地保护触发: taskId=%s symbol=%s side=%s reason=%s triggerPrice=%.8f marketPrice=%.8f quantity=%.8f",
+			task.ID, task.Symbol, task.Side, triggerReason, at.protectionTriggerPrice(task, triggerReason), price, task.Quantity)
+
+		var closeErr error
+		if task.Side == "LONG" {
+			_, closeErr = at.trader.CloseLong(task.Symbol, task.Quantity)
+		} else {
+			_, closeErr = at.trader.CloseShort(task.Symbol, task.Quantity)
+		}
+		if closeErr != nil {
+			log.Printf("⚠ 本地保护执行平仓失败: taskId=%s symbol=%s side=%s reason=%s err=%v",
+				task.ID, task.Symbol, task.Side, triggerReason, closeErr)
+			continue
+		}
+
+		log.Printf("✅ 本地保护执行成功: taskId=%s symbol=%s side=%s reason=%s quantity=%.8f",
+			task.ID, task.Symbol, task.Side, triggerReason, task.Quantity)
+		at.removeProtectionTask(task.ID)
+		return
+	}
+}
+
+func (at *AutoTrader) protectionTriggerPrice(task contextProtectionTask, reason string) float64 {
+	if reason == "stop_loss" {
+		return task.StopLossPrice
+	}
+	return task.TakeProfitPrice
+}
+
+func (at *AutoTrader) hasProtectionTask(taskID string) bool {
+	at.protectionMu.Lock()
+	defer at.protectionMu.Unlock()
+	_, ok := at.protectionTasks[taskID]
+	return ok
+}
+
+func (at *AutoTrader) removeProtectionTask(taskID string) {
+	at.protectionMu.Lock()
+	defer at.protectionMu.Unlock()
+	delete(at.protectionTasks, taskID)
+}
+
+func (at *AutoTrader) clearProtectionTasks() {
+	at.protectionMu.Lock()
+	defer at.protectionMu.Unlock()
+	for taskID := range at.protectionTasks {
+		delete(at.protectionTasks, taskID)
+	}
 }
 
 func (at *AutoTrader) ensureNoSymbolPosition(symbol string) error {
