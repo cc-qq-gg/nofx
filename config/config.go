@@ -61,6 +61,7 @@ type Config struct {
 	DefaultCoins       []string       `json:"default_coins"`     // 默认主流币种池
 	CoinPoolAPIURL     string         `json:"coin_pool_api_url"`
 	OITopAPIURL        string         `json:"oi_top_api_url"`
+	DisableAutoTrading bool           `json:"disable_auto_trading"`
 	APIServerPort      int            `json:"api_server_port"`
 	APIServerHTTPS     bool           `json:"api_server_https"`
 	APITLSAutoGenerate bool           `json:"api_tls_auto_generate"`

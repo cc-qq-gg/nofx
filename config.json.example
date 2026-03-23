@@ -81,6 +81,7 @@
   ],
   "coin_pool_api_url": "",
   "oi_top_api_url": "",
+  "disable_auto_trading": false,
   "api_server_port": 8080,
   "api_server_https": false,
   "api_tls_auto_generate": true,

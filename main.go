@@ -99,12 +99,19 @@ func main() {
 	}
 
 	fmt.Println()
-	fmt.Println("🤖 AI全权决策模式:")
-	fmt.Printf("  • AI将自主决定每笔交易的杠杆倍数（山寨币最高%d倍，BTC/ETH最高%d倍）\n",
-		cfg.Leverage.AltcoinLeverage, cfg.Leverage.BTCETHLeverage)
-	fmt.Println("  • AI将自主决定每笔交易的仓位大小")
-	fmt.Println("  • AI将自主设置止损和止盈价格")
-	fmt.Println("  • AI将基于市场数据、技术指标、账户状态做出全面分析")
+	if cfg.DisableAutoTrading {
+		fmt.Println("🛑 自动交易轮询已禁用:")
+		fmt.Println("  • 不启动 AI 分析")
+		fmt.Println("  • 不启动定时扫描和自动下单")
+		fmt.Println("  • 仅保留 HTTPS API 与手动风控下单功能")
+	} else {
+		fmt.Println("🤖 AI全权决策模式:")
+		fmt.Printf("  • AI将自主决定每笔交易的杠杆倍数（山寨币最高%d倍，BTC/ETH最高%d倍）\n",
+			cfg.Leverage.AltcoinLeverage, cfg.Leverage.BTCETHLeverage)
+		fmt.Println("  • AI将自主决定每笔交易的仓位大小")
+		fmt.Println("  • AI将自主设置止损和止盈价格")
+		fmt.Println("  • AI将基于市场数据、技术指标、账户状态做出全面分析")
+	}
 	fmt.Println()
 	fmt.Println("⚠️  风险提示: AI自动交易有风险，建议小额资金测试！")
 	fmt.Println()
@@ -133,14 +140,22 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	// 启动所有trader
-	traderManager.StartAll()
+	if cfg.DisableAutoTrading {
+		log.Println("⏸ 已禁用自动交易轮询，仅启动API服务")
+	} else {
+		traderManager.StartAll()
+	}
 
 	// 等待退出信号
 	<-sigChan
 	fmt.Println()
 	fmt.Println()
-	log.Println("📛 收到退出信号，正在停止所有trader...")
-	traderManager.StopAll()
+	if cfg.DisableAutoTrading {
+		log.Println("📛 收到退出信号，正在停止API服务...")
+	} else {
+		log.Println("📛 收到退出信号，正在停止所有trader...")
+		traderManager.StopAll()
+	}
 
 	fmt.Println()
 	fmt.Println("👋 感谢使用AI交易竞赛系统！")
