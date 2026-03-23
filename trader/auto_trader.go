@@ -802,6 +802,8 @@ func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderRespons
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("🚀 收到手动风控下单请求: trader=%s symbol=%s side=%s clientOrderID=%s",
+		at.id, req.Symbol, side, req.ClientOrderID)
 
 	binanceTrader, ok := at.trader.(*FuturesTrader)
 	if !ok {
@@ -835,6 +837,8 @@ func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderRespons
 	if referencePrice <= 0 {
 		return nil, fmt.Errorf("参考价格无效")
 	}
+	log.Printf("📚 下单参考盘口: symbol=%s side=%s bid=%.8f ask=%.8f reference=%.8f",
+		req.Symbol, side, bestBid, bestAsk, referencePrice)
 
 	structuralStopRatio, err := calculateStructuralStopRatio(req.Symbol, side, referencePrice)
 	if err != nil {
@@ -852,11 +856,15 @@ func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderRespons
 	if calc.Margin > availableBalance {
 		return nil, fmt.Errorf("所需保证金%.4f超过可用余额%.4f", calc.Margin, availableBalance)
 	}
+	log.Printf("🧮 风控计算结果: symbol=%s side=%s equity=%.8f available=%.8f structuralStop=%.6f actualStop=%.6f margin=%.8f notional=%.8f quantity=%.8f",
+		req.Symbol, side, equity, availableBalance, structuralStopRatio, calc.ActualStopLossRatio, calc.Margin, calc.Notional, calc.Quantity)
 
 	entryOrderPrice := referencePrice * (1 + riskEntryOffsetRatio)
 	if side == "SHORT" {
 		entryOrderPrice = referencePrice * (1 - riskEntryOffsetRatio)
 	}
+	log.Printf("📝 IOC激进限价: symbol=%s side=%s entryOrderPrice=%.8f offset=%.4f%%",
+		req.Symbol, side, entryOrderPrice, riskEntryOffsetRatio*100)
 
 	orderResult, err := binanceTrader.PlaceAggressiveRiskEntry(req.Symbol, side, calc.Quantity, riskFixedLeverage, entryOrderPrice)
 	if err != nil {
@@ -866,8 +874,11 @@ func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderRespons
 	filledQuantity, _ := orderResult["executedQty"].(float64)
 	avgFillPrice, _ := orderResult["avgPrice"].(float64)
 	orderID, _ := orderResult["orderId"].(int64)
+	log.Printf("📦 风控下单结果: symbol=%s side=%s orderId=%d status=%v filledQty=%.8f avgPrice=%.8f",
+		req.Symbol, side, orderID, orderResult["status"], filledQuantity, avgFillPrice)
 
 	if filledQuantity <= 0 || avgFillPrice <= 0 {
+		log.Printf("⚠ IOC最终未成交: symbol=%s side=%s orderId=%d", req.Symbol, side, orderID)
 		return &RiskOrderResponse{
 			Accepted:                false,
 			RejectReason:            "IOC订单未成交",
@@ -895,6 +906,8 @@ func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderRespons
 		stopLossPrice = avgFillPrice * (1 + calc.ActualStopLossRatio)
 		takeProfitPrice = avgFillPrice * (1 - riskTakeProfitRatio)
 	}
+	log.Printf("🛡 保护单参数: symbol=%s side=%s filledQty=%.8f avgPrice=%.8f stopLoss=%.8f takeProfit=%.8f",
+		req.Symbol, side, filledQuantity, avgFillPrice, stopLossPrice, takeProfitPrice)
 
 	stopPlaced := true
 	if err := at.trader.SetStopLoss(req.Symbol, side, filledQuantity, stopLossPrice); err != nil {

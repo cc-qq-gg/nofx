@@ -236,8 +236,8 @@ func (t *FuturesTrader) OpenLong(symbol string, quantity float64, leverage int) 
 		return nil, err
 	}
 
-	// 设置逐仓模式
-	if err := t.SetMarginType(symbol, futures.MarginTypeIsolated); err != nil {
+	// 设置全仓模式
+	if err := t.SetMarginType(symbol, futures.MarginTypeCrossed); err != nil {
 		return nil, err
 	}
 
@@ -282,8 +282,8 @@ func (t *FuturesTrader) OpenShort(symbol string, quantity float64, leverage int)
 		return nil, err
 	}
 
-	// 设置逐仓模式
-	if err := t.SetMarginType(symbol, futures.MarginTypeIsolated); err != nil {
+	// 设置全仓模式
+	if err := t.SetMarginType(symbol, futures.MarginTypeCrossed); err != nil {
 		return nil, err
 	}
 
@@ -543,10 +543,13 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 
 // PlaceAggressiveRiskEntry 按激进限价IOC下单
 func (t *FuturesTrader) PlaceAggressiveRiskEntry(symbol string, positionSide string, quantity float64, leverage int, limitPrice float64) (map[string]interface{}, error) {
+	log.Printf("🔐 风控下单准备: symbol=%s side=%s leverage=%dx rawQuantity=%.8f rawLimitPrice=%.8f",
+		symbol, positionSide, leverage, quantity, limitPrice)
+
 	if err := t.SetLeverage(symbol, leverage); err != nil {
 		return nil, err
 	}
-	if err := t.SetMarginType(symbol, futures.MarginTypeIsolated); err != nil {
+	if err := t.SetMarginType(symbol, futures.MarginTypeCrossed); err != nil {
 		return nil, err
 	}
 
@@ -562,6 +565,8 @@ func (t *FuturesTrader) PlaceAggressiveRiskEntry(symbol string, positionSide str
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("📐 风控下单格式化后: symbol=%s side=%s quantity=%s limitPrice=%s",
+		symbol, positionSide, quantityStr, priceStr)
 
 	side := futures.SideTypeBuy
 	posSide := futures.PositionSideTypeLong
@@ -576,12 +581,15 @@ func (t *FuturesTrader) PlaceAggressiveRiskEntry(symbol string, positionSide str
 		PositionSide(posSide).
 		Type(futures.OrderTypeLimit).
 		TimeInForce(futures.TimeInForceTypeIOC).
+		NewOrderResponseType(futures.NewOrderRespTypeRESULT).
 		Price(priceStr).
 		Quantity(quantityStr).
 		Do(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("下单失败: %w", err)
 	}
+	log.Printf("📨 币安下单回包: symbol=%s orderId=%d status=%s executedQty=%s avgPrice=%s cumQuote=%s",
+		symbol, order.OrderID, order.Status, order.ExecutedQuantity, order.AvgPrice, order.CumQuote)
 
 	result := make(map[string]interface{})
 	result["orderId"] = order.OrderID
@@ -590,9 +598,57 @@ func (t *FuturesTrader) PlaceAggressiveRiskEntry(symbol string, positionSide str
 
 	executedQty, _ := strconv.ParseFloat(order.ExecutedQuantity, 64)
 	avgPrice, _ := strconv.ParseFloat(order.AvgPrice, 64)
+
+	finalOrder, err := t.waitFinalOrderStatus(symbol, order.OrderID)
+	if err != nil {
+		log.Printf("⚠ 查询最终订单状态失败，使用创建回包兜底: symbol=%s orderId=%d err=%v", symbol, order.OrderID, err)
+	} else {
+		log.Printf("✅ 最终订单状态: symbol=%s orderId=%d status=%s executedQty=%s avgPrice=%s cumQuote=%s",
+			symbol, finalOrder.OrderID, finalOrder.Status, finalOrder.ExecutedQuantity, finalOrder.AvgPrice, finalOrder.CumQuote)
+		result["status"] = finalOrder.Status
+		if qty, parseErr := strconv.ParseFloat(finalOrder.ExecutedQuantity, 64); parseErr == nil {
+			executedQty = qty
+		}
+		if price, parseErr := strconv.ParseFloat(finalOrder.AvgPrice, 64); parseErr == nil {
+			avgPrice = price
+		}
+	}
+
 	result["executedQty"] = executedQty
 	result["avgPrice"] = avgPrice
 	return result, nil
+}
+
+func (t *FuturesTrader) waitFinalOrderStatus(symbol string, orderID int64) (*futures.Order, error) {
+	var lastOrder *futures.Order
+	var lastErr error
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		order, err := t.client.NewGetOrderService().
+			Symbol(symbol).
+			OrderID(orderID).
+			Do(context.Background())
+		if err != nil {
+			lastErr = err
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		lastOrder = order
+		if order.Status == futures.OrderStatusTypeFilled ||
+			order.Status == futures.OrderStatusTypeExpired ||
+			order.Status == futures.OrderStatusTypeCanceled ||
+			order.Status == futures.OrderStatusTypePartiallyFilled {
+			return order, nil
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if lastOrder != nil {
+		return lastOrder, nil
+	}
+	return nil, fmt.Errorf("查询订单状态失败: %w", lastErr)
 }
 
 // GetSymbolPrecision 获取交易对的数量精度
