@@ -9,6 +9,7 @@ import (
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +103,8 @@ type contextProtectionTask struct {
 	TakeProfitPrice float64
 	CreatedAt       time.Time
 }
+
+const protectionQuantityEpsilon = 1e-9
 
 // NewAutoTrader 创建自动交易器
 func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
@@ -1019,39 +1022,45 @@ func (at *AutoTrader) runLocalProtection(task contextProtectionTask) {
 
 	pollCount := 0
 	for range ticker.C {
-		if !at.hasProtectionTask(task.ID) {
+		if err := at.syncProtectionTasksForPosition(task.Symbol, task.Side); err != nil {
+			log.Printf("⚠ 本地保护持仓同步失败: taskId=%s symbol=%s side=%s err=%v", task.ID, task.Symbol, task.Side, err)
+			continue
+		}
+
+		currentTask, ok := at.getProtectionTask(task.ID)
+		if !ok {
 			return
 		}
 
-		price, err := at.trader.GetMarketPrice(task.Symbol)
+		price, err := at.trader.GetMarketPrice(currentTask.Symbol)
 		if err != nil {
-			log.Printf("⚠ 本地保护任务取价失败: taskId=%s symbol=%s err=%v", task.ID, task.Symbol, err)
+			log.Printf("⚠ 本地保护任务取价失败: taskId=%s symbol=%s err=%v", currentTask.ID, currentTask.Symbol, err)
 			continue
 		}
 
 		pollCount++
 		if pollCount == 1 || pollCount%15 == 0 {
 			log.Printf("📡 本地保护巡检: taskId=%s symbol=%s side=%s price=%.8f stopLoss=%.8f takeProfit=%.8f",
-				task.ID, task.Symbol, task.Side, price, task.StopLossPrice, task.TakeProfitPrice)
+				currentTask.ID, currentTask.Symbol, currentTask.Side, price, currentTask.StopLossPrice, currentTask.TakeProfitPrice)
 		}
 
 		triggerReason := ""
-		switch task.Side {
+		switch currentTask.Side {
 		case "LONG":
-			if price <= task.StopLossPrice {
+			if price <= currentTask.StopLossPrice {
 				triggerReason = "stop_loss"
-			} else if price >= task.TakeProfitPrice {
+			} else if price >= currentTask.TakeProfitPrice {
 				triggerReason = "take_profit"
 			}
 		case "SHORT":
-			if price >= task.StopLossPrice {
+			if price >= currentTask.StopLossPrice {
 				triggerReason = "stop_loss"
-			} else if price <= task.TakeProfitPrice {
+			} else if price <= currentTask.TakeProfitPrice {
 				triggerReason = "take_profit"
 			}
 		default:
-			log.Printf("⚠ 本地保护任务方向无效: taskId=%s side=%s", task.ID, task.Side)
-			at.removeProtectionTask(task.ID)
+			log.Printf("⚠ 本地保护任务方向无效: taskId=%s side=%s", currentTask.ID, currentTask.Side)
+			at.removeProtectionTask(currentTask.ID)
 			return
 		}
 
@@ -1060,23 +1069,29 @@ func (at *AutoTrader) runLocalProtection(task contextProtectionTask) {
 		}
 
 		log.Printf("🚨 本地保护触发: taskId=%s symbol=%s side=%s reason=%s triggerPrice=%.8f marketPrice=%.8f quantity=%.8f",
-			task.ID, task.Symbol, task.Side, triggerReason, at.protectionTriggerPrice(task, triggerReason), price, task.Quantity)
+			currentTask.ID, currentTask.Symbol, currentTask.Side, triggerReason, at.protectionTriggerPrice(currentTask, triggerReason), price, currentTask.Quantity)
 
 		var closeErr error
-		if task.Side == "LONG" {
-			_, closeErr = at.trader.CloseLong(task.Symbol, task.Quantity)
+		if currentTask.Side == "LONG" {
+			_, closeErr = at.trader.CloseLong(currentTask.Symbol, currentTask.Quantity)
 		} else {
-			_, closeErr = at.trader.CloseShort(task.Symbol, task.Quantity)
+			_, closeErr = at.trader.CloseShort(currentTask.Symbol, currentTask.Quantity)
 		}
 		if closeErr != nil {
+			if at.isNoPositionError(closeErr) {
+				log.Printf("🧹 本地保护触发前发现仓位已无效，任务取消: taskId=%s symbol=%s side=%s err=%v",
+					currentTask.ID, currentTask.Symbol, currentTask.Side, closeErr)
+				at.removeProtectionTask(currentTask.ID)
+				return
+			}
 			log.Printf("⚠ 本地保护执行平仓失败: taskId=%s symbol=%s side=%s reason=%s err=%v",
-				task.ID, task.Symbol, task.Side, triggerReason, closeErr)
+				currentTask.ID, currentTask.Symbol, currentTask.Side, triggerReason, closeErr)
 			continue
 		}
 
 		log.Printf("✅ 本地保护执行成功: taskId=%s symbol=%s side=%s reason=%s quantity=%.8f",
-			task.ID, task.Symbol, task.Side, triggerReason, task.Quantity)
-		at.removeProtectionTask(task.ID)
+			currentTask.ID, currentTask.Symbol, currentTask.Side, triggerReason, currentTask.Quantity)
+		at.removeProtectionTask(currentTask.ID)
 		return
 	}
 }
@@ -1088,11 +1103,11 @@ func (at *AutoTrader) protectionTriggerPrice(task contextProtectionTask, reason 
 	return task.TakeProfitPrice
 }
 
-func (at *AutoTrader) hasProtectionTask(taskID string) bool {
+func (at *AutoTrader) getProtectionTask(taskID string) (contextProtectionTask, bool) {
 	at.protectionMu.Lock()
 	defer at.protectionMu.Unlock()
-	_, ok := at.protectionTasks[taskID]
-	return ok
+	task, ok := at.protectionTasks[taskID]
+	return task, ok
 }
 
 func (at *AutoTrader) removeProtectionTask(taskID string) {
@@ -1107,6 +1122,117 @@ func (at *AutoTrader) clearProtectionTasks() {
 	for taskID := range at.protectionTasks {
 		delete(at.protectionTasks, taskID)
 	}
+}
+
+func (at *AutoTrader) syncProtectionTasksForPosition(symbol, side string) error {
+	currentPositionQty, err := at.getCurrentPositionQuantity(symbol, side)
+	if err != nil {
+		return err
+	}
+
+	at.protectionMu.Lock()
+	defer at.protectionMu.Unlock()
+
+	var tasks []contextProtectionTask
+	totalProtectedQty := 0.0
+	for _, task := range at.protectionTasks {
+		if task.Symbol == symbol && task.Side == side {
+			tasks = append(tasks, task)
+			totalProtectedQty += task.Quantity
+		}
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].CreatedAt.Equal(tasks[j].CreatedAt) {
+			return tasks[i].ID < tasks[j].ID
+		}
+		return tasks[i].CreatedAt.Before(tasks[j].CreatedAt)
+	})
+
+	log.Printf("🧭 本地保护持仓同步: symbol=%s side=%s currentPosition=%.8f protectedTotal=%.8f taskCount=%d",
+		symbol, side, currentPositionQty, totalProtectedQty, len(tasks))
+
+	if currentPositionQty <= protectionQuantityEpsilon {
+		for _, task := range tasks {
+			delete(at.protectionTasks, task.ID)
+			log.Printf("🗑 本地保护任务取消: taskId=%s symbol=%s side=%s reason=manual_closed",
+				task.ID, task.Symbol, task.Side)
+		}
+		return nil
+	}
+
+	if currentPositionQty+protectionQuantityEpsilon >= totalProtectedQty {
+		return nil
+	}
+
+	excessQty := totalProtectedQty - currentPositionQty
+	for _, task := range tasks {
+		if excessQty <= protectionQuantityEpsilon {
+			break
+		}
+
+		if task.Quantity <= excessQty+protectionQuantityEpsilon {
+			delete(at.protectionTasks, task.ID)
+			excessQty -= task.Quantity
+			log.Printf("✂ 本地保护任务缩减: taskId=%s symbol=%s side=%s oldQty=%.8f newQty=0.00000000 reason=manual_reduce_fifo",
+				task.ID, task.Symbol, task.Side, task.Quantity)
+			continue
+		}
+
+		updatedTask := task
+		updatedTask.Quantity = task.Quantity - excessQty
+		at.protectionTasks[task.ID] = updatedTask
+		log.Printf("✂ 本地保护任务缩减: taskId=%s symbol=%s side=%s oldQty=%.8f newQty=%.8f reason=manual_reduce_fifo",
+			task.ID, task.Symbol, task.Side, task.Quantity, updatedTask.Quantity)
+		excessQty = 0
+	}
+
+	return nil
+}
+
+func (at *AutoTrader) getCurrentPositionQuantity(symbol, side string) (float64, error) {
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return 0, fmt.Errorf("获取持仓失败: %w", err)
+	}
+
+	for _, pos := range positions {
+		if pos["symbol"] != symbol {
+			continue
+		}
+
+		positionSide, _ := pos["side"].(string)
+		positionAmt, ok := pos["positionAmt"].(float64)
+		if !ok {
+			continue
+		}
+
+		if side == "LONG" && positionSide == "long" {
+			if positionAmt < 0 {
+				return -positionAmt, nil
+			}
+			return positionAmt, nil
+		}
+		if side == "SHORT" && positionSide == "short" {
+			if positionAmt < 0 {
+				return -positionAmt, nil
+			}
+			return positionAmt, nil
+		}
+	}
+
+	return 0, nil
+}
+
+func (at *AutoTrader) isNoPositionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := err.Error()
+	return strings.Contains(errText, "没有找到") || strings.Contains(errText, "position is zero")
 }
 
 func (at *AutoTrader) ensureNoSymbolPosition(symbol string) error {
