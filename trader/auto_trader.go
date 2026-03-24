@@ -94,17 +94,21 @@ type AutoTrader struct {
 }
 
 type contextProtectionTask struct {
-	ID              string
-	Symbol          string
-	Side            string
-	Quantity        float64
-	EntryPrice      float64
-	StopLossPrice   float64
-	TakeProfitPrice float64
-	CreatedAt       time.Time
+	ID                    string
+	Symbol                string
+	Side                  string
+	Quantity              float64
+	EntryPrice            float64
+	BaseStopLossPrice     float64
+	BaseTakeProfitPrice   float64
+	StopLossPrice         float64
+	TakeProfitPrice       float64
+	AppliedProtectionStep int
+	CreatedAt             time.Time
 }
 
 const protectionQuantityEpsilon = 1e-9
+const protectionMaxStep = 20
 
 // NewAutoTrader 创建自动交易器
 func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
@@ -995,14 +999,17 @@ func (at *AutoTrader) registerLocalProtection(symbol, side string, quantity, ent
 
 	taskID := fmt.Sprintf("%s-%s-%d", at.id, strings.ToLower(symbol), time.Now().UnixNano())
 	task := contextProtectionTask{
-		ID:              taskID,
-		Symbol:          symbol,
-		Side:            side,
-		Quantity:        quantity,
-		EntryPrice:      entryPrice,
-		StopLossPrice:   stopLossPrice,
-		TakeProfitPrice: takeProfitPrice,
-		CreatedAt:       time.Now(),
+		ID:                    taskID,
+		Symbol:                symbol,
+		Side:                  side,
+		Quantity:              quantity,
+		EntryPrice:            entryPrice,
+		BaseStopLossPrice:     stopLossPrice,
+		BaseTakeProfitPrice:   takeProfitPrice,
+		StopLossPrice:         stopLossPrice,
+		TakeProfitPrice:       takeProfitPrice,
+		AppliedProtectionStep: 0,
+		CreatedAt:             time.Now(),
 	}
 
 	at.protectionMu.Lock()
@@ -1037,6 +1044,8 @@ func (at *AutoTrader) runLocalProtection(task contextProtectionTask) {
 			log.Printf("⚠ 本地保护任务取价失败: taskId=%s symbol=%s err=%v", currentTask.ID, currentTask.Symbol, err)
 			continue
 		}
+
+		currentTask = at.advanceProtectionTask(currentTask, price)
 
 		pollCount++
 		if pollCount == 1 || pollCount%15 == 0 {
@@ -1101,6 +1110,73 @@ func (at *AutoTrader) protectionTriggerPrice(task contextProtectionTask, reason 
 		return task.StopLossPrice
 	}
 	return task.TakeProfitPrice
+}
+
+func (at *AutoTrader) advanceProtectionTask(task contextProtectionTask, price float64) contextProtectionTask {
+	step, stopLossPrice, takeProfitPrice := computeDynamicProtection(task, price)
+	if step <= task.AppliedProtectionStep {
+		return task
+	}
+
+	updatedTask := task
+	updatedTask.AppliedProtectionStep = step
+	updatedTask.StopLossPrice = stopLossPrice
+	updatedTask.TakeProfitPrice = takeProfitPrice
+
+	at.protectionMu.Lock()
+	if _, ok := at.protectionTasks[task.ID]; ok {
+		at.protectionTasks[task.ID] = updatedTask
+	}
+	at.protectionMu.Unlock()
+
+	log.Printf("📈 本地保护阶梯上调: taskId=%s symbol=%s side=%s step=%d price=%.8f stopLoss=%.8f takeProfit=%.8f",
+		updatedTask.ID, updatedTask.Symbol, updatedTask.Side, updatedTask.AppliedProtectionStep, price, updatedTask.StopLossPrice, updatedTask.TakeProfitPrice)
+	return updatedTask
+}
+
+func computeDynamicProtection(task contextProtectionTask, price float64) (int, float64, float64) {
+	if task.EntryPrice <= 0 {
+		return task.AppliedProtectionStep, task.StopLossPrice, task.TakeProfitPrice
+	}
+
+	favorableMoveRatio := 0.0
+	switch task.Side {
+	case "LONG":
+		favorableMoveRatio = (price - task.EntryPrice) / task.EntryPrice
+	case "SHORT":
+		favorableMoveRatio = (task.EntryPrice - price) / task.EntryPrice
+	default:
+		return task.AppliedProtectionStep, task.StopLossPrice, task.TakeProfitPrice
+	}
+
+	if favorableMoveRatio < 0.01 {
+		return task.AppliedProtectionStep, task.StopLossPrice, task.TakeProfitPrice
+	}
+
+	step := int(favorableMoveRatio * 100)
+	if step > protectionMaxStep {
+		step = protectionMaxStep
+	}
+	if step < 1 {
+		return task.AppliedProtectionStep, task.StopLossPrice, task.TakeProfitPrice
+	}
+
+	stopMoveRatio := 0.004 + 0.009*float64(step-1)
+	takeProfitMoveRatio := 0.025 + 0.01*float64(step-1)
+
+	stopLossPrice := task.BaseStopLossPrice
+	takeProfitPrice := task.BaseTakeProfitPrice
+
+	if task.Side == "LONG" {
+		stopLossPrice = task.EntryPrice * (1 + stopMoveRatio)
+		takeProfitPrice = task.EntryPrice * (1 + takeProfitMoveRatio)
+	}
+	if task.Side == "SHORT" {
+		stopLossPrice = task.EntryPrice * (1 - stopMoveRatio)
+		takeProfitPrice = task.EntryPrice * (1 - takeProfitMoveRatio)
+	}
+
+	return step, stopLossPrice, takeProfitPrice
 }
 
 func (at *AutoTrader) getProtectionTask(taskID string) (contextProtectionTask, bool) {
