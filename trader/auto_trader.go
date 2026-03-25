@@ -91,6 +91,8 @@ type AutoTrader struct {
 	positionFirstSeenTime map[string]int64 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
 	protectionMu          sync.Mutex
 	protectionTasks       map[string]contextProtectionTask
+	triggerMu             sync.Mutex
+	triggerTasks          map[string]riskTriggerTask
 }
 
 type contextProtectionTask struct {
@@ -105,6 +107,18 @@ type contextProtectionTask struct {
 	TakeProfitPrice       float64
 	AppliedProtectionStep int
 	CreatedAt             time.Time
+}
+
+type riskTriggerTask struct {
+	ID               string
+	Symbol           string
+	Side             string
+	TriggerPrice     float64
+	TriggerDirection string
+	ClientOrderID    string
+	Status           string
+	ExpireAt         time.Time
+	CreatedAt        time.Time
 }
 
 const protectionQuantityEpsilon = 1e-9
@@ -203,6 +217,7 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 		isRunning:             false,
 		positionFirstSeenTime: make(map[string]int64),
 		protectionTasks:       make(map[string]contextProtectionTask),
+		triggerTasks:          make(map[string]riskTriggerTask),
 	}, nil
 }
 
@@ -238,6 +253,7 @@ func (at *AutoTrader) Run() error {
 func (at *AutoTrader) Stop() {
 	at.isRunning = false
 	at.clearProtectionTasks()
+	at.clearTriggerTasks()
 	log.Println("⏹ 自动交易系统停止")
 }
 
@@ -828,6 +844,17 @@ func (at *AutoTrader) ExecuteRiskOrder(req *RiskOrderRequest) (*RiskOrderRespons
 	log.Printf("🚀 收到手动风控下单请求: trader=%s symbol=%s side=%s clientOrderID=%s",
 		at.id, req.Symbol, side, req.ClientOrderID)
 
+	if req.Price > 0 {
+		return at.registerTriggerRiskOrder(req, side)
+	}
+
+	return at.executeImmediateRiskOrder(req, side)
+}
+
+func (at *AutoTrader) executeImmediateRiskOrder(req *RiskOrderRequest, side string) (*RiskOrderResponse, error) {
+	log.Printf("⚡ 执行即时风控下单: trader=%s symbol=%s side=%s clientOrderID=%s",
+		at.id, req.Symbol, side, req.ClientOrderID)
+
 	binanceTrader, ok := at.trader.(*FuturesTrader)
 	if !ok {
 		return nil, fmt.Errorf("当前trader仅支持币安风控下单接口")
@@ -1020,6 +1047,169 @@ func (at *AutoTrader) registerLocalProtection(symbol, side string, quantity, ent
 	return taskID, nil
 }
 
+func (at *AutoTrader) registerTriggerRiskOrder(req *RiskOrderRequest, side string) (*RiskOrderResponse, error) {
+	binanceTrader, ok := at.trader.(*FuturesTrader)
+	if !ok {
+		return nil, fmt.Errorf("当前trader仅支持币安风控下单接口")
+	}
+
+	if err := at.ensureNoSymbolPosition(req.Symbol); err != nil {
+		return nil, err
+	}
+
+	bestBid, bestAsk, err := binanceTrader.GetBestBidAsk(req.Symbol)
+	if err != nil {
+		return nil, fmt.Errorf("获取盘口失败: %w", err)
+	}
+
+	currentPrice := bestAsk
+	if side == "SHORT" {
+		currentPrice = bestBid
+	}
+	if currentPrice <= 0 {
+		return nil, fmt.Errorf("参考价格无效")
+	}
+
+	triggerDirection := determineTriggerDirection(req.Price, currentPrice)
+	if triggerDirection == "" {
+		log.Printf("ℹ 触发价等于当前价，直接降级为即时下单: symbol=%s side=%s price=%.8f", req.Symbol, side, req.Price)
+		return at.executeImmediateRiskOrder(req, side)
+	}
+
+	triggerTask, replacedTaskID := at.upsertTriggerTask(req, side, triggerDirection)
+	expireAt := triggerTask.ExpireAt.Format(time.RFC3339)
+	if replacedTaskID != "" {
+		log.Printf("♻ 监听任务已替换: oldTaskId=%s newTaskId=%s symbol=%s side=%s triggerPrice=%.8f direction=%s",
+			replacedTaskID, triggerTask.ID, triggerTask.Symbol, triggerTask.Side, triggerTask.TriggerPrice, triggerTask.TriggerDirection)
+	} else {
+		log.Printf("📝 监听任务已创建: taskId=%s symbol=%s side=%s triggerPrice=%.8f direction=%s expireAt=%s",
+			triggerTask.ID, triggerTask.Symbol, triggerTask.Side, triggerTask.TriggerPrice, triggerTask.TriggerDirection, expireAt)
+	}
+
+	go at.runTriggerTask(triggerTask)
+
+	return &RiskOrderResponse{
+		Accepted:         true,
+		TraderID:         at.id,
+		Symbol:           req.Symbol,
+		Side:             side,
+		TriggerPrice:     req.Price,
+		TriggerDirection: triggerDirection,
+		TriggerStatus:    triggerTask.Status,
+		TriggerExpireAt:  expireAt,
+	}, nil
+}
+
+func determineTriggerDirection(targetPrice, currentPrice float64) string {
+	switch {
+	case targetPrice > currentPrice:
+		return "up"
+	case targetPrice < currentPrice:
+		return "down"
+	default:
+		return ""
+	}
+}
+
+func (at *AutoTrader) upsertTriggerTask(req *RiskOrderRequest, side, triggerDirection string) (riskTriggerTask, string) {
+	at.triggerMu.Lock()
+	defer at.triggerMu.Unlock()
+
+	replacedTaskID := ""
+	for taskID, task := range at.triggerTasks {
+		if task.Symbol == req.Symbol && task.Side == side && task.Status == "pending" {
+			replacedTaskID = taskID
+			task.Status = "replaced"
+			at.triggerTasks[taskID] = task
+			delete(at.triggerTasks, taskID)
+			break
+		}
+	}
+
+	taskID := fmt.Sprintf("%s-%s-%s-%d", at.id, strings.ToLower(req.Symbol), strings.ToLower(side), time.Now().UnixNano())
+	triggerTask := riskTriggerTask{
+		ID:               taskID,
+		Symbol:           req.Symbol,
+		Side:             side,
+		TriggerPrice:     req.Price,
+		TriggerDirection: triggerDirection,
+		ClientOrderID:    req.ClientOrderID,
+		Status:           "pending",
+		ExpireAt:         time.Now().Add(24 * time.Hour),
+		CreatedAt:        time.Now(),
+	}
+	at.triggerTasks[taskID] = triggerTask
+	return triggerTask, replacedTaskID
+}
+
+func (at *AutoTrader) runTriggerTask(task riskTriggerTask) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		currentTask, ok := at.getTriggerTask(task.ID)
+		if !ok || currentTask.Status != "pending" {
+			return
+		}
+
+		if time.Now().After(currentTask.ExpireAt) {
+			at.updateTriggerTaskStatus(currentTask.ID, "expired")
+			log.Printf("⏰ 监听任务已过期: taskId=%s symbol=%s side=%s triggerPrice=%.8f",
+				currentTask.ID, currentTask.Symbol, currentTask.Side, currentTask.TriggerPrice)
+			at.removeTriggerTask(currentTask.ID)
+			return
+		}
+
+		price, err := at.trader.GetMarketPrice(currentTask.Symbol)
+		if err != nil {
+			log.Printf("⚠ 监听任务取价失败: taskId=%s symbol=%s err=%v", currentTask.ID, currentTask.Symbol, err)
+			continue
+		}
+
+		triggered := false
+		if currentTask.TriggerDirection == "up" && price >= currentTask.TriggerPrice {
+			triggered = true
+		}
+		if currentTask.TriggerDirection == "down" && price <= currentTask.TriggerPrice {
+			triggered = true
+		}
+		if !triggered {
+			continue
+		}
+
+		at.updateTriggerTaskStatus(currentTask.ID, "triggered")
+		log.Printf("🎯 监听任务触发: taskId=%s symbol=%s side=%s triggerPrice=%.8f marketPrice=%.8f direction=%s",
+			currentTask.ID, currentTask.Symbol, currentTask.Side, currentTask.TriggerPrice, price, currentTask.TriggerDirection)
+
+		req := &RiskOrderRequest{
+			Symbol:        currentTask.Symbol,
+			Side:          currentTask.Side,
+			ClientOrderID: currentTask.ClientOrderID,
+		}
+		resp, err := at.executeImmediateRiskOrder(req, currentTask.Side)
+		if err != nil {
+			log.Printf("⚠ 监听任务触发后执行失败: taskId=%s symbol=%s side=%s err=%v",
+				currentTask.ID, currentTask.Symbol, currentTask.Side, err)
+			at.updateTriggerTaskStatus(currentTask.ID, "triggered_unfilled")
+			at.removeTriggerTask(currentTask.ID)
+			return
+		}
+		if !resp.Accepted {
+			log.Printf("⚠ 监听任务触发后 IOC 未成交: taskId=%s symbol=%s side=%s rejectReason=%s",
+				currentTask.ID, currentTask.Symbol, currentTask.Side, resp.RejectReason)
+			at.updateTriggerTaskStatus(currentTask.ID, "triggered_unfilled")
+			at.removeTriggerTask(currentTask.ID)
+			return
+		}
+
+		at.updateTriggerTaskStatus(currentTask.ID, "filled")
+		log.Printf("✅ 监听任务触发后下单成功: taskId=%s symbol=%s side=%s protectionTaskId=%s",
+			currentTask.ID, currentTask.Symbol, currentTask.Side, resp.ProtectionTaskID)
+		at.removeTriggerTask(currentTask.ID)
+		return
+	}
+}
+
 func (at *AutoTrader) runLocalProtection(task contextProtectionTask) {
 	log.Printf("🛰 本地保护任务启动: taskId=%s symbol=%s side=%s quantity=%.8f entry=%.8f stopLoss=%.8f takeProfit=%.8f",
 		task.ID, task.Symbol, task.Side, task.Quantity, task.EntryPrice, task.StopLossPrice, task.TakeProfitPrice)
@@ -1197,6 +1387,38 @@ func (at *AutoTrader) clearProtectionTasks() {
 	defer at.protectionMu.Unlock()
 	for taskID := range at.protectionTasks {
 		delete(at.protectionTasks, taskID)
+	}
+}
+
+func (at *AutoTrader) getTriggerTask(taskID string) (riskTriggerTask, bool) {
+	at.triggerMu.Lock()
+	defer at.triggerMu.Unlock()
+	task, ok := at.triggerTasks[taskID]
+	return task, ok
+}
+
+func (at *AutoTrader) updateTriggerTaskStatus(taskID, status string) {
+	at.triggerMu.Lock()
+	defer at.triggerMu.Unlock()
+	task, ok := at.triggerTasks[taskID]
+	if !ok {
+		return
+	}
+	task.Status = status
+	at.triggerTasks[taskID] = task
+}
+
+func (at *AutoTrader) removeTriggerTask(taskID string) {
+	at.triggerMu.Lock()
+	defer at.triggerMu.Unlock()
+	delete(at.triggerTasks, taskID)
+}
+
+func (at *AutoTrader) clearTriggerTasks() {
+	at.triggerMu.Lock()
+	defer at.triggerMu.Unlock()
+	for taskID := range at.triggerTasks {
+		delete(at.triggerTasks, taskID)
 	}
 }
 

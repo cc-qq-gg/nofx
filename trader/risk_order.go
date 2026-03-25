@@ -22,9 +22,10 @@ const (
 )
 
 type RiskOrderRequest struct {
-	Symbol        string `json:"symbol"`
-	Side          string `json:"side"`
-	ClientOrderID string `json:"client_order_id"`
+	Symbol        string  `json:"symbol"`
+	Side          string  `json:"side"`
+	Price         float64 `json:"price,omitempty"`
+	ClientOrderID string  `json:"client_order_id"`
 }
 
 type RiskOrderResponse struct {
@@ -53,6 +54,10 @@ type RiskOrderResponse struct {
 	TakeProfitOrderPlaced   bool    `json:"take_profit_order_placed"`
 	ProtectionMode          string  `json:"protection_mode,omitempty"`
 	ProtectionTaskID        string  `json:"protection_task_id,omitempty"`
+	TriggerPrice            float64 `json:"trigger_price,omitempty"`
+	TriggerDirection        string  `json:"trigger_direction,omitempty"`
+	TriggerStatus           string  `json:"trigger_status,omitempty"`
+	TriggerExpireAt         string  `json:"trigger_expire_at,omitempty"`
 }
 
 func NormalizeRiskSide(side string) (string, error) {
