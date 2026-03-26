@@ -230,6 +230,17 @@ func (t *FuturesTrader) SetMarginType(symbol string, marginType futures.MarginTy
 
 // GetBestBidAsk 获取盘口一档
 func (t *FuturesTrader) GetBestBidAsk(symbol string) (float64, float64, error) {
+	if t.useWebsocketPrice {
+		if bid, ask, ok := t.getWebsocketBestBidAsk(symbol); ok {
+			return bid, ask, nil
+		}
+		log.Printf("⚠ %s websocket盘口不可用，回退REST盘口", symbol)
+	}
+
+	return t.getRESTBestBidAsk(symbol)
+}
+
+func (t *FuturesTrader) getRESTBestBidAsk(symbol string) (float64, float64, error) {
 	book, err := t.client.NewListBookTickersService().Symbol(symbol).Do(context.Background())
 	if err != nil {
 		return 0, 0, fmt.Errorf("获取盘口失败: %w", err)
@@ -494,22 +505,8 @@ func (t *FuturesTrader) getRESTMarketPrice(symbol string) (float64, error) {
 }
 
 func (t *FuturesTrader) getWebsocketMarketPrice(symbol string) (float64, bool) {
-	t.ensurePriceFeed(symbol)
-
-	t.wsPriceMu.RLock()
-	feed, ok := t.wsPriceFeeds[strings.ToUpper(symbol)]
+	price, bestBid, bestAsk, ok := t.getWebsocketPriceSnapshot(symbol)
 	if !ok {
-		t.wsPriceMu.RUnlock()
-		return 0, false
-	}
-	price := feed.price
-	updatedAt := feed.updatedAt
-	connected := feed.connected
-	bestBid := feed.bestBid
-	bestAsk := feed.bestAsk
-	t.wsPriceMu.RUnlock()
-
-	if !connected || updatedAt.IsZero() || time.Since(updatedAt) > websocketPriceMaxStaleness {
 		return 0, false
 	}
 	if price > 0 {
@@ -525,6 +522,37 @@ func (t *FuturesTrader) getWebsocketMarketPrice(symbol string) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func (t *FuturesTrader) getWebsocketBestBidAsk(symbol string) (float64, float64, bool) {
+	_, bestBid, bestAsk, ok := t.getWebsocketPriceSnapshot(symbol)
+	if !ok || bestBid <= 0 || bestAsk <= 0 {
+		return 0, 0, false
+	}
+	return bestBid, bestAsk, true
+}
+
+func (t *FuturesTrader) getWebsocketPriceSnapshot(symbol string) (float64, float64, float64, bool) {
+	t.ensurePriceFeed(symbol)
+
+	t.wsPriceMu.RLock()
+	feed, ok := t.wsPriceFeeds[strings.ToUpper(symbol)]
+	if !ok {
+		t.wsPriceMu.RUnlock()
+		return 0, 0, 0, false
+	}
+	price := feed.price
+	bestBid := feed.bestBid
+	bestAsk := feed.bestAsk
+	updatedAt := feed.updatedAt
+	connected := feed.connected
+	t.wsPriceMu.RUnlock()
+
+	if !connected || updatedAt.IsZero() || time.Since(updatedAt) > websocketPriceMaxStaleness {
+		return 0, 0, 0, false
+	}
+
+	return price, bestBid, bestAsk, true
 }
 
 func (t *FuturesTrader) ensurePriceFeed(symbol string) {
