@@ -101,6 +101,8 @@ type contextProtectionTask struct {
 	Side                  string
 	Quantity              float64
 	EntryPrice            float64
+	HighestPriceSeen      float64
+	LowestPriceSeen       float64
 	BaseStopLossPrice     float64
 	BaseTakeProfitPrice   float64
 	StopLossPrice         float64
@@ -1031,6 +1033,8 @@ func (at *AutoTrader) registerLocalProtection(symbol, side string, quantity, ent
 		Side:                  side,
 		Quantity:              quantity,
 		EntryPrice:            entryPrice,
+		HighestPriceSeen:      entryPrice,
+		LowestPriceSeen:       entryPrice,
 		BaseStopLossPrice:     stopLossPrice,
 		BaseTakeProfitPrice:   takeProfitPrice,
 		StopLossPrice:         stopLossPrice,
@@ -1303,15 +1307,34 @@ func (at *AutoTrader) protectionTriggerPrice(task contextProtectionTask, reason 
 }
 
 func (at *AutoTrader) advanceProtectionTask(task contextProtectionTask, price float64) contextProtectionTask {
-	step, stopLossPrice, takeProfitPrice := computeDynamicProtection(task, price)
-	if step <= task.AppliedProtectionStep {
+	updatedTask := task
+	switch updatedTask.Side {
+	case "LONG":
+		if price > updatedTask.HighestPriceSeen {
+			updatedTask.HighestPriceSeen = price
+		}
+		if updatedTask.LowestPriceSeen == 0 || price < updatedTask.LowestPriceSeen {
+			updatedTask.LowestPriceSeen = price
+		}
+	case "SHORT":
+		if updatedTask.HighestPriceSeen == 0 || price > updatedTask.HighestPriceSeen {
+			updatedTask.HighestPriceSeen = price
+		}
+		if updatedTask.LowestPriceSeen == 0 || price < updatedTask.LowestPriceSeen {
+			updatedTask.LowestPriceSeen = price
+		}
+	}
+
+	step, stopLossPrice, takeProfitPrice := computeDynamicProtection(updatedTask)
+	if step <= updatedTask.AppliedProtectionStep && updatedTask.HighestPriceSeen == task.HighestPriceSeen && updatedTask.LowestPriceSeen == task.LowestPriceSeen {
 		return task
 	}
 
-	updatedTask := task
-	updatedTask.AppliedProtectionStep = step
-	updatedTask.StopLossPrice = stopLossPrice
-	updatedTask.TakeProfitPrice = takeProfitPrice
+	updatedTask.AppliedProtectionStep = max(updatedTask.AppliedProtectionStep, step)
+	if step > task.AppliedProtectionStep {
+		updatedTask.StopLossPrice = stopLossPrice
+		updatedTask.TakeProfitPrice = takeProfitPrice
+	}
 
 	at.protectionMu.Lock()
 	if _, ok := at.protectionTasks[task.ID]; ok {
@@ -1319,12 +1342,14 @@ func (at *AutoTrader) advanceProtectionTask(task contextProtectionTask, price fl
 	}
 	at.protectionMu.Unlock()
 
-	log.Printf("📈 本地保护阶梯上调: taskId=%s symbol=%s side=%s step=%d price=%.8f stopLoss=%.8f takeProfit=%.8f",
-		updatedTask.ID, updatedTask.Symbol, updatedTask.Side, updatedTask.AppliedProtectionStep, price, updatedTask.StopLossPrice, updatedTask.TakeProfitPrice)
+	if step > task.AppliedProtectionStep {
+		log.Printf("📈 本地保护阶梯上调: taskId=%s symbol=%s side=%s step=%d price=%.8f bestHigh=%.8f bestLow=%.8f stopLoss=%.8f takeProfit=%.8f",
+			updatedTask.ID, updatedTask.Symbol, updatedTask.Side, updatedTask.AppliedProtectionStep, price, updatedTask.HighestPriceSeen, updatedTask.LowestPriceSeen, updatedTask.StopLossPrice, updatedTask.TakeProfitPrice)
+	}
 	return updatedTask
 }
 
-func computeDynamicProtection(task contextProtectionTask, price float64) (int, float64, float64) {
+func computeDynamicProtection(task contextProtectionTask) (int, float64, float64) {
 	if task.EntryPrice <= 0 {
 		return task.AppliedProtectionStep, task.StopLossPrice, task.TakeProfitPrice
 	}
@@ -1332,9 +1357,17 @@ func computeDynamicProtection(task contextProtectionTask, price float64) (int, f
 	favorableMoveRatio := 0.0
 	switch task.Side {
 	case "LONG":
-		favorableMoveRatio = (price - task.EntryPrice) / task.EntryPrice
+		referencePrice := task.HighestPriceSeen
+		if referencePrice <= 0 {
+			referencePrice = task.EntryPrice
+		}
+		favorableMoveRatio = (referencePrice - task.EntryPrice) / task.EntryPrice
 	case "SHORT":
-		favorableMoveRatio = (task.EntryPrice - price) / task.EntryPrice
+		referencePrice := task.LowestPriceSeen
+		if referencePrice <= 0 {
+			referencePrice = task.EntryPrice
+		}
+		favorableMoveRatio = (task.EntryPrice - referencePrice) / task.EntryPrice
 	default:
 		return task.AppliedProtectionStep, task.StopLossPrice, task.TakeProfitPrice
 	}
