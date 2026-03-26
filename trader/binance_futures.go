@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,8 +16,9 @@ import (
 
 // FuturesTrader 币安合约交易器
 type FuturesTrader struct {
-	client          *futures.Client
-	portfolioClient *portfolio.Client
+	client            *futures.Client
+	portfolioClient   *portfolio.Client
+	useWebsocketPrice bool
 
 	// 余额缓存
 	cachedBalance     map[string]interface{}
@@ -30,16 +32,35 @@ type FuturesTrader struct {
 
 	// 缓存有效期（15秒）
 	cacheDuration time.Duration
+
+	wsPriceMu    sync.RWMutex
+	wsPriceFeeds map[string]*wsPriceFeed
 }
 
+type wsPriceFeed struct {
+	symbol    string
+	price     float64
+	bestBid   float64
+	bestAsk   float64
+	updatedAt time.Time
+	connected bool
+	starting  bool
+	doneC     chan struct{}
+	stopC     chan struct{}
+}
+
+const websocketPriceMaxStaleness = 5 * time.Second
+
 // NewFuturesTrader 创建合约交易器
-func NewFuturesTrader(apiKey, secretKey string) *FuturesTrader {
+func NewFuturesTrader(apiKey, secretKey string, useWebsocketPrice bool) *FuturesTrader {
 	client := futures.NewClient(apiKey, secretKey)
 	portfolioClient := portfolio.NewClient(apiKey, secretKey)
 	return &FuturesTrader{
-		client:          client,
-		portfolioClient: portfolioClient,
-		cacheDuration:   15 * time.Second, // 15秒缓存
+		client:            client,
+		portfolioClient:   portfolioClient,
+		useWebsocketPrice: useWebsocketPrice,
+		cacheDuration:     15 * time.Second, // 15秒缓存
+		wsPriceFeeds:      make(map[string]*wsPriceFeed),
 	}
 }
 
@@ -444,6 +465,17 @@ func (t *FuturesTrader) CancelAllOrders(symbol string) error {
 
 // GetMarketPrice 获取市场价格
 func (t *FuturesTrader) GetMarketPrice(symbol string) (float64, error) {
+	if t.useWebsocketPrice {
+		if price, ok := t.getWebsocketMarketPrice(symbol); ok {
+			return price, nil
+		}
+		log.Printf("⚠ %s websocket价格不可用，回退REST价格", symbol)
+	}
+
+	return t.getRESTMarketPrice(symbol)
+}
+
+func (t *FuturesTrader) getRESTMarketPrice(symbol string) (float64, error) {
 	prices, err := t.client.NewListPricesService().Symbol(symbol).Do(context.Background())
 	if err != nil {
 		return 0, fmt.Errorf("获取价格失败: %w", err)
@@ -459,6 +491,141 @@ func (t *FuturesTrader) GetMarketPrice(symbol string) (float64, error) {
 	}
 
 	return price, nil
+}
+
+func (t *FuturesTrader) getWebsocketMarketPrice(symbol string) (float64, bool) {
+	t.ensurePriceFeed(symbol)
+
+	t.wsPriceMu.RLock()
+	feed, ok := t.wsPriceFeeds[strings.ToUpper(symbol)]
+	if !ok {
+		t.wsPriceMu.RUnlock()
+		return 0, false
+	}
+	price := feed.price
+	updatedAt := feed.updatedAt
+	connected := feed.connected
+	bestBid := feed.bestBid
+	bestAsk := feed.bestAsk
+	t.wsPriceMu.RUnlock()
+
+	if !connected || updatedAt.IsZero() || time.Since(updatedAt) > websocketPriceMaxStaleness {
+		return 0, false
+	}
+	if price > 0 {
+		return price, true
+	}
+	switch {
+	case bestBid > 0 && bestAsk > 0:
+		return (bestBid + bestAsk) / 2, true
+	case bestBid > 0:
+		return bestBid, true
+	case bestAsk > 0:
+		return bestAsk, true
+	default:
+		return 0, false
+	}
+}
+
+func (t *FuturesTrader) ensurePriceFeed(symbol string) {
+	symbol = strings.ToUpper(symbol)
+
+	t.wsPriceMu.Lock()
+	feed, ok := t.wsPriceFeeds[symbol]
+	if ok && (feed.connected || feed.starting) {
+		t.wsPriceMu.Unlock()
+		return
+	}
+	if !ok {
+		feed = &wsPriceFeed{symbol: symbol}
+		t.wsPriceFeeds[symbol] = feed
+	}
+	feed.starting = true
+	t.wsPriceMu.Unlock()
+
+	doneC, stopC, err := futures.WsBookTickerServe(symbol, func(event *futures.WsBookTickerEvent) {
+		bestBid, err := strconv.ParseFloat(event.BestBidPrice, 64)
+		if err != nil {
+			log.Printf("⚠ %s websocket买一价解析失败: %v", symbol, err)
+			return
+		}
+		bestAsk, err := strconv.ParseFloat(event.BestAskPrice, 64)
+		if err != nil {
+			log.Printf("⚠ %s websocket卖一价解析失败: %v", symbol, err)
+			return
+		}
+
+		t.wsPriceMu.Lock()
+		currentFeed, exists := t.wsPriceFeeds[symbol]
+		if exists {
+			currentFeed.bestBid = bestBid
+			currentFeed.bestAsk = bestAsk
+			currentFeed.price = (bestBid + bestAsk) / 2
+			currentFeed.updatedAt = time.Now()
+			currentFeed.connected = true
+		}
+		t.wsPriceMu.Unlock()
+	}, func(err error) {
+		log.Printf("⚠ %s websocket价格流异常: %v", symbol, err)
+		t.wsPriceMu.Lock()
+		currentFeed, exists := t.wsPriceFeeds[symbol]
+		if exists {
+			currentFeed.connected = false
+			currentFeed.starting = false
+		}
+		t.wsPriceMu.Unlock()
+	})
+	if err != nil {
+		t.wsPriceMu.Lock()
+		if currentFeed, exists := t.wsPriceFeeds[symbol]; exists {
+			currentFeed.connected = false
+			currentFeed.starting = false
+		}
+		t.wsPriceMu.Unlock()
+		log.Printf("⚠ %s websocket价格流启动失败: %v", symbol, err)
+		return
+	}
+
+	t.wsPriceMu.Lock()
+	currentFeed, exists := t.wsPriceFeeds[symbol]
+	if exists {
+		currentFeed.doneC = doneC
+		currentFeed.stopC = stopC
+		currentFeed.connected = true
+		currentFeed.starting = false
+	}
+	t.wsPriceMu.Unlock()
+
+	log.Printf("📡 %s websocket价格流已启动", symbol)
+
+	go func(sym string, feedDoneC chan struct{}) {
+		<-feedDoneC
+		t.wsPriceMu.Lock()
+		if currentFeed, exists := t.wsPriceFeeds[sym]; exists && currentFeed.doneC == feedDoneC {
+			currentFeed.connected = false
+			currentFeed.starting = false
+			currentFeed.doneC = nil
+			currentFeed.stopC = nil
+		}
+		t.wsPriceMu.Unlock()
+		log.Printf("📴 %s websocket价格流已结束", sym)
+	}(symbol, doneC)
+}
+
+func (t *FuturesTrader) StopPriceFeeds() {
+	t.wsPriceMu.Lock()
+	defer t.wsPriceMu.Unlock()
+
+	for symbol, feed := range t.wsPriceFeeds {
+		if feed.stopC != nil {
+			close(feed.stopC)
+		}
+		feed.connected = false
+		feed.starting = false
+		feed.doneC = nil
+		feed.stopC = nil
+		log.Printf("📴 %s websocket价格流已停止", symbol)
+	}
 }
 
 // CalculatePositionSize 计算仓位大小

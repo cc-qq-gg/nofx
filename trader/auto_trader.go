@@ -26,8 +26,9 @@ type AutoTraderConfig struct {
 	Exchange string // "binance", "hyperliquid" 或 "aster"
 
 	// 币安API配置
-	BinanceAPIKey    string
-	BinanceSecretKey string
+	BinanceAPIKey            string
+	BinanceSecretKey         string
+	BinanceUseWebsocketPrice bool
 
 	// Hyperliquid配置
 	HyperliquidPrivateKey string
@@ -177,7 +178,12 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 	switch config.Exchange {
 	case "binance":
 		log.Printf("🏦 [%s] 使用币安合约交易", config.Name)
-		trader = NewFuturesTrader(config.BinanceAPIKey, config.BinanceSecretKey)
+		if config.BinanceUseWebsocketPrice {
+			log.Printf("📡 [%s] 币安价格源: websocket 优先，REST 回退", config.Name)
+		} else {
+			log.Printf("📡 [%s] 币安价格源: REST", config.Name)
+		}
+		trader = NewFuturesTrader(config.BinanceAPIKey, config.BinanceSecretKey, config.BinanceUseWebsocketPrice)
 	case "hyperliquid":
 		log.Printf("🏦 [%s] 使用Hyperliquid交易", config.Name)
 		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidWalletAddr, config.HyperliquidTestnet)
@@ -256,6 +262,9 @@ func (at *AutoTrader) Stop() {
 	at.isRunning = false
 	at.clearProtectionTasks()
 	at.clearTriggerTasks()
+	if futuresTrader, ok := at.trader.(*FuturesTrader); ok {
+		futuresTrader.StopPriceFeeds()
+	}
 	log.Println("⏹ 自动交易系统停止")
 }
 

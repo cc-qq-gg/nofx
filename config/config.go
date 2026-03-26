@@ -18,8 +18,9 @@ type TraderConfig struct {
 	Exchange string `json:"exchange"` // "binance" or "hyperliquid"
 
 	// 币安配置
-	BinanceAPIKey    string `json:"binance_api_key,omitempty"`
-	BinanceSecretKey string `json:"binance_secret_key,omitempty"`
+	BinanceAPIKey            string `json:"binance_api_key,omitempty"`
+	BinanceSecretKey         string `json:"binance_secret_key,omitempty"`
+	BinanceUseWebsocketPrice *bool  `json:"binance_use_websocket_price,omitempty"`
 
 	// Hyperliquid配置
 	HyperliquidPrivateKey string `json:"hyperliquid_private_key,omitempty"`
@@ -225,4 +226,12 @@ func (c *Config) Validate() error {
 // GetScanInterval 获取扫描间隔
 func (tc *TraderConfig) GetScanInterval() time.Duration {
 	return time.Duration(tc.ScanIntervalMinutes) * time.Minute
+}
+
+// GetBinanceUseWebsocketPrice 获取币安价格源开关，默认启用 websocket
+func (tc *TraderConfig) GetBinanceUseWebsocketPrice() bool {
+	if tc.BinanceUseWebsocketPrice == nil {
+		return true
+	}
+	return *tc.BinanceUseWebsocketPrice
 }
