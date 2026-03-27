@@ -882,7 +882,7 @@ func (at *AutoTrader) executeImmediateRiskOrder(req *RiskOrderRequest, side stri
 		return nil, fmt.Errorf("账户净值无效")
 	}
 
-	if err := at.ensureNoSymbolPosition(req.Symbol); err != nil {
+	if err := at.ensureNoSameSidePosition(req.Symbol, side); err != nil {
 		return nil, err
 	}
 
@@ -1066,7 +1066,7 @@ func (at *AutoTrader) registerTriggerRiskOrder(req *RiskOrderRequest, side strin
 		return nil, fmt.Errorf("当前trader仅支持币安风控下单接口")
 	}
 
-	if err := at.ensureNoSymbolPosition(req.Symbol); err != nil {
+	if err := at.ensureNoSameSidePosition(req.Symbol, side); err != nil {
 		return nil, err
 	}
 
@@ -1394,6 +1394,9 @@ func computeDynamicProtection(task contextProtectionTask) (int, float64, float64
 	}
 
 	stopMoveRatio := 0.004 + 0.009*float64(step-1)
+	if step == 1 {
+		stopMoveRatio = 0.003
+	}
 	takeProfitMoveRatio := 0.025 + 0.01*float64(step-1)
 
 	stopLossPrice := task.BaseStopLossPrice
@@ -1575,14 +1578,26 @@ func (at *AutoTrader) isNoPositionError(err error) bool {
 	return strings.Contains(errText, "没有找到") || strings.Contains(errText, "position is zero")
 }
 
-func (at *AutoTrader) ensureNoSymbolPosition(symbol string) error {
+func (at *AutoTrader) ensureNoSameSidePosition(symbol, side string) error {
 	positions, err := at.trader.GetPositions()
 	if err != nil {
 		return fmt.Errorf("获取持仓失败: %w", err)
 	}
 	for _, pos := range positions {
-		if pos["symbol"] == symbol {
-			return fmt.Errorf("%s 当前已有持仓，拒绝重复开仓", symbol)
+		if pos["symbol"] != symbol {
+			continue
+		}
+
+		positionSide, _ := pos["side"].(string)
+		switch side {
+		case "LONG":
+			if positionSide == "long" {
+				return fmt.Errorf("%s 当前已有多仓，拒绝重复开多", symbol)
+			}
+		case "SHORT":
+			if positionSide == "short" {
+				return fmt.Errorf("%s 当前已有空仓，拒绝重复开空", symbol)
+			}
 		}
 	}
 	return nil
