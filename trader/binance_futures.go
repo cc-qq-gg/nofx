@@ -45,11 +45,16 @@ type wsPriceFeed struct {
 	updatedAt time.Time
 	connected bool
 	starting  bool
+	ready     bool
 	doneC     chan struct{}
 	stopC     chan struct{}
+
+	lastFallbackKey   string
+	lastFallbackLogAt time.Time
 }
 
 const websocketPriceMaxStaleness = 5 * time.Second
+const websocketFallbackLogThrottle = 30 * time.Second
 
 // NewFuturesTrader 创建合约交易器
 func NewFuturesTrader(apiKey, secretKey string, useWebsocketPrice bool) *FuturesTrader {
@@ -231,10 +236,11 @@ func (t *FuturesTrader) SetMarginType(symbol string, marginType futures.MarginTy
 // GetBestBidAsk 获取盘口一档
 func (t *FuturesTrader) GetBestBidAsk(symbol string) (float64, float64, error) {
 	if t.useWebsocketPrice {
-		if bid, ask, ok := t.getWebsocketBestBidAsk(symbol); ok {
+		if bid, ask, ok, reason := t.getWebsocketBestBidAsk(symbol); ok {
 			return bid, ask, nil
+		} else if reason != "" {
+			t.logWebsocketFallback(symbol, "盘口", reason)
 		}
-		log.Printf("⚠ %s websocket盘口不可用，回退REST盘口", symbol)
 	}
 
 	return t.getRESTBestBidAsk(symbol)
@@ -477,10 +483,11 @@ func (t *FuturesTrader) CancelAllOrders(symbol string) error {
 // GetMarketPrice 获取市场价格
 func (t *FuturesTrader) GetMarketPrice(symbol string) (float64, error) {
 	if t.useWebsocketPrice {
-		if price, ok := t.getWebsocketMarketPrice(symbol); ok {
+		if price, ok, reason := t.getWebsocketMarketPrice(symbol); ok {
 			return price, nil
+		} else if reason != "" {
+			t.logWebsocketFallback(symbol, "价格", reason)
 		}
-		log.Printf("⚠ %s websocket价格不可用，回退REST价格", symbol)
 	}
 
 	return t.getRESTMarketPrice(symbol)
@@ -504,55 +511,78 @@ func (t *FuturesTrader) getRESTMarketPrice(symbol string) (float64, error) {
 	return price, nil
 }
 
-func (t *FuturesTrader) getWebsocketMarketPrice(symbol string) (float64, bool) {
-	price, bestBid, bestAsk, ok := t.getWebsocketPriceSnapshot(symbol)
+func (t *FuturesTrader) getWebsocketMarketPrice(symbol string) (float64, bool, string) {
+	price, bestBid, bestAsk, ok, reason := t.getWebsocketPriceSnapshot(symbol)
 	if !ok {
-		return 0, false
+		return 0, false, reason
 	}
 	if price > 0 {
-		return price, true
+		return price, true, ""
 	}
 	switch {
 	case bestBid > 0 && bestAsk > 0:
-		return (bestBid + bestAsk) / 2, true
+		return (bestBid + bestAsk) / 2, true, ""
 	case bestBid > 0:
-		return bestBid, true
+		return bestBid, true, ""
 	case bestAsk > 0:
-		return bestAsk, true
+		return bestAsk, true, ""
 	default:
-		return 0, false
+		return 0, false, "盘口缓存为空"
 	}
 }
 
-func (t *FuturesTrader) getWebsocketBestBidAsk(symbol string) (float64, float64, bool) {
-	_, bestBid, bestAsk, ok := t.getWebsocketPriceSnapshot(symbol)
+func (t *FuturesTrader) getWebsocketBestBidAsk(symbol string) (float64, float64, bool, string) {
+	_, bestBid, bestAsk, ok, reason := t.getWebsocketPriceSnapshot(symbol)
 	if !ok || bestBid <= 0 || bestAsk <= 0 {
-		return 0, 0, false
+		if reason == "" {
+			reason = "买一/卖一缓存为空"
+		}
+		return 0, 0, false, reason
 	}
-	return bestBid, bestAsk, true
+	return bestBid, bestAsk, true, ""
 }
 
-func (t *FuturesTrader) getWebsocketPriceSnapshot(symbol string) (float64, float64, float64, bool) {
+func (t *FuturesTrader) getWebsocketPriceSnapshot(symbol string) (float64, float64, float64, bool, string) {
 	t.ensurePriceFeed(symbol)
 
 	t.wsPriceMu.RLock()
 	feed, ok := t.wsPriceFeeds[strings.ToUpper(symbol)]
 	if !ok {
 		t.wsPriceMu.RUnlock()
-		return 0, 0, 0, false
+		return 0, 0, 0, false, "价格流未初始化"
 	}
 	price := feed.price
 	bestBid := feed.bestBid
 	bestAsk := feed.bestAsk
 	updatedAt := feed.updatedAt
 	connected := feed.connected
+	starting := feed.starting
+	ready := feed.ready
 	t.wsPriceMu.RUnlock()
 
-	if !connected || updatedAt.IsZero() || time.Since(updatedAt) > websocketPriceMaxStaleness {
-		return 0, 0, 0, false
+	if !ready {
+		if starting {
+			return 0, 0, 0, false, "订阅已启动，等待首帧"
+		}
+		if !connected && updatedAt.IsZero() {
+			return 0, 0, 0, false, "连接未建立，尚未收到首帧"
+		}
+		return 0, 0, 0, false, "尚未收到首帧"
 	}
 
-	return price, bestBid, bestAsk, true
+	if !connected {
+		return 0, 0, 0, false, "连接已断开"
+	}
+
+	if updatedAt.IsZero() {
+		return 0, 0, 0, false, "缓存时间为空"
+	}
+
+	if staleFor := time.Since(updatedAt); staleFor > websocketPriceMaxStaleness {
+		return 0, 0, 0, false, fmt.Sprintf("最近%.1f秒无更新", staleFor.Seconds())
+	}
+
+	return price, bestBid, bestAsk, true, ""
 }
 
 func (t *FuturesTrader) ensurePriceFeed(symbol string) {
@@ -586,11 +616,18 @@ func (t *FuturesTrader) ensurePriceFeed(symbol string) {
 		t.wsPriceMu.Lock()
 		currentFeed, exists := t.wsPriceFeeds[symbol]
 		if exists {
+			wasReady := currentFeed.ready
 			currentFeed.bestBid = bestBid
 			currentFeed.bestAsk = bestAsk
 			currentFeed.price = (bestBid + bestAsk) / 2
 			currentFeed.updatedAt = time.Now()
 			currentFeed.connected = true
+			currentFeed.starting = false
+			currentFeed.ready = true
+			if !wasReady {
+				log.Printf("✅ %s websocket盘口已就绪: bid=%.8f ask=%.8f mid=%.8f",
+					symbol, bestBid, bestAsk, currentFeed.price)
+			}
 		}
 		t.wsPriceMu.Unlock()
 	}, func(err error) {
@@ -620,11 +657,12 @@ func (t *FuturesTrader) ensurePriceFeed(symbol string) {
 		currentFeed.doneC = doneC
 		currentFeed.stopC = stopC
 		currentFeed.connected = true
-		currentFeed.starting = false
+		currentFeed.starting = true
+		currentFeed.ready = false
 	}
 	t.wsPriceMu.Unlock()
 
-	log.Printf("📡 %s websocket价格流已启动", symbol)
+	log.Printf("📡 %s websocket盘口订阅已启动，等待首帧...", symbol)
 
 	go func(sym string, feedDoneC chan struct{}) {
 		<-feedDoneC
@@ -638,6 +676,42 @@ func (t *FuturesTrader) ensurePriceFeed(symbol string) {
 		t.wsPriceMu.Unlock()
 		log.Printf("📴 %s websocket价格流已结束", sym)
 	}(symbol, doneC)
+}
+
+func shouldLogWebsocketFallback(feed *wsPriceFeed, fallbackKey string, now time.Time) bool {
+	if feed == nil {
+		return true
+	}
+	if feed.lastFallbackKey != fallbackKey {
+		return true
+	}
+	if feed.lastFallbackLogAt.IsZero() {
+		return true
+	}
+	return now.Sub(feed.lastFallbackLogAt) >= websocketFallbackLogThrottle
+}
+
+func (t *FuturesTrader) logWebsocketFallback(symbol, kind, reason string) {
+	symbol = strings.ToUpper(symbol)
+	now := time.Now()
+	fallbackKey := kind + ":" + reason
+
+	t.wsPriceMu.Lock()
+	feed, ok := t.wsPriceFeeds[symbol]
+	if !ok {
+		feed = &wsPriceFeed{symbol: symbol}
+		t.wsPriceFeeds[symbol] = feed
+	}
+	shouldLog := shouldLogWebsocketFallback(feed, fallbackKey, now)
+	if shouldLog {
+		feed.lastFallbackKey = fallbackKey
+		feed.lastFallbackLogAt = now
+	}
+	t.wsPriceMu.Unlock()
+
+	if shouldLog {
+		log.Printf("⚠ %s websocket%s不可用(%s)，回退REST%s", symbol, kind, reason, kind)
+	}
 }
 
 func (t *FuturesTrader) StopPriceFeeds() {
