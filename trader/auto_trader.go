@@ -109,6 +109,7 @@ type contextProtectionTask struct {
 	StopLossPrice         float64
 	TakeProfitPrice       float64
 	AppliedProtectionStep int
+	StepOnePartialTaken   bool
 	CreatedAt             time.Time
 }
 
@@ -1250,6 +1251,22 @@ func (at *AutoTrader) runLocalProtection(task contextProtectionTask) {
 
 		currentTask = at.advanceProtectionTask(currentTask, price)
 
+		updatedTask, partialTaken, partialErr := at.maybeTakeStepOnePartialProfit(currentTask)
+		if partialErr != nil {
+			if at.isNoPositionError(partialErr) {
+				log.Printf("🧹 本地保护1%%半仓止盈时发现仓位已无效，任务取消: taskId=%s symbol=%s side=%s err=%v",
+					currentTask.ID, currentTask.Symbol, currentTask.Side, partialErr)
+				at.removeProtectionTask(currentTask.ID)
+				return
+			}
+			log.Printf("⚠ 本地保护1%%半仓止盈失败: taskId=%s symbol=%s side=%s err=%v",
+				currentTask.ID, currentTask.Symbol, currentTask.Side, partialErr)
+		}
+		if partialTaken {
+			currentTask = updatedTask
+			continue
+		}
+
 		pollCount++
 		if pollCount == 1 || pollCount%15 == 0 {
 			log.Printf("📡 本地保护巡检: taskId=%s symbol=%s side=%s price=%.8f stopLoss=%.8f takeProfit=%.8f",
@@ -1358,6 +1375,47 @@ func (at *AutoTrader) advanceProtectionTask(task contextProtectionTask, price fl
 	return updatedTask
 }
 
+func (at *AutoTrader) maybeTakeStepOnePartialProfit(task contextProtectionTask) (contextProtectionTask, bool, error) {
+	if task.StepOnePartialTaken || task.AppliedProtectionStep < 1 {
+		return task, false, nil
+	}
+	if task.Quantity <= protectionQuantityEpsilon {
+		return task, false, nil
+	}
+
+	partialQty := task.Quantity / 2
+	if partialQty <= protectionQuantityEpsilon {
+		return task, false, nil
+	}
+
+	var closeErr error
+	if task.Side == "LONG" {
+		_, closeErr = at.trader.CloseLong(task.Symbol, partialQty)
+	} else {
+		_, closeErr = at.trader.CloseShort(task.Symbol, partialQty)
+	}
+	if closeErr != nil {
+		return task, false, closeErr
+	}
+
+	updatedTask := task
+	updatedTask.Quantity = task.Quantity - partialQty
+	updatedTask.StopLossPrice = task.EntryPrice
+	updatedTask.TakeProfitPrice = firstProtectionTakeProfitPrice(task)
+	updatedTask.AppliedProtectionStep = 1
+	updatedTask.StepOnePartialTaken = true
+
+	at.protectionMu.Lock()
+	if _, ok := at.protectionTasks[task.ID]; ok {
+		at.protectionTasks[task.ID] = updatedTask
+	}
+	at.protectionMu.Unlock()
+
+	log.Printf("💰 本地保护1%%半仓止盈成功: taskId=%s symbol=%s side=%s closedQty=%.8f remainingQty=%.8f stopLoss=%.8f",
+		task.ID, task.Symbol, task.Side, partialQty, updatedTask.Quantity, updatedTask.StopLossPrice)
+	return updatedTask, true, nil
+}
+
 func computeDynamicProtection(task contextProtectionTask) (int, float64, float64) {
 	if task.EntryPrice <= 0 {
 		return task.AppliedProtectionStep, task.StopLossPrice, task.TakeProfitPrice
@@ -1395,7 +1453,7 @@ func computeDynamicProtection(task contextProtectionTask) (int, float64, float64
 
 	stopMoveRatio := 0.004 + 0.009*float64(step-1)
 	if step == 1 {
-		stopMoveRatio = 0.003
+		stopMoveRatio = 0
 	}
 	takeProfitMoveRatio := 0.025 + 0.01*float64(step-1)
 
@@ -1412,6 +1470,13 @@ func computeDynamicProtection(task contextProtectionTask) (int, float64, float64
 	}
 
 	return step, stopLossPrice, takeProfitPrice
+}
+
+func firstProtectionTakeProfitPrice(task contextProtectionTask) float64 {
+	if task.Side == "SHORT" {
+		return task.EntryPrice * (1 - 0.025)
+	}
+	return task.EntryPrice * (1 + 0.025)
 }
 
 func (at *AutoTrader) getProtectionTask(taskID string) (contextProtectionTask, bool) {
